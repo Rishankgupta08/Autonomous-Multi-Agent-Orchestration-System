@@ -1,6 +1,9 @@
 # Spring Boot secrets
+
 moae-backend/src/main/resources/application.properties
 moae-backend/src/main/resources/application-*.properties
+
+!moae-backend/src/main/resources/application-example.properties
 
 # Environment files
 .env
