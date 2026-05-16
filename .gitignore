@@ -1,0 +1,39 @@
+# Spring Boot secrets
+moae-backend/src/main/resources/application.properties
+moae-backend/src/main/resources/application-*.properties
+
+# Environment files
+.env
+
+# Maven build
+target/
+
+# IntelliJ
+.idea/
+
+# VS Code
+.vscode/
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Node modules
+node_modules/
+
+# PDF files
+*.pdf
+
+# Build folders
+dist/
+build/
+
+# Java
+*.class
+*.jar
+
+# macOS
+.DS_Store

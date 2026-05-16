@@ -1,0 +1,144 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
+             https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <!-- ================================================================
+         PARENT — Spring Boot 3.2.5
+         Provides dependency management + plugin management out of the box.
+    ================================================================ -->
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>3.2.5</version>
+        <relativePath/> <!-- look up parent from Maven Central, not local FS -->
+    </parent>
+
+    <!-- ================================================================
+         PROJECT COORDINATES
+    ================================================================ -->
+    <groupId>com.moae</groupId>
+    <artifactId>moae-backend</artifactId>
+    <version>0.0.1-SNAPSHOT</version>
+    <name>moae-backend</name>
+    <description>MOAE — Autonomous Multi-Agent Orchestration Engine (Backend)</description>
+    <packaging>jar</packaging>
+
+    <!-- ================================================================
+         JAVA VERSION
+    ================================================================ -->
+    <properties>
+        <!-- Target Java 21 bytecode even though JDK 25 is installed.           -->
+        <!-- Spring Boot 3.2.5 Maven plugin cannot load class file version 69.  -->
+        <!-- Compiling for release 21 produces version 65 which it can handle.  -->
+        <java.version>21</java.version>
+    </properties>
+
+    <!-- ================================================================
+         DEPENDENCIES
+         Only the 6 dependencies defined in Section 2.
+         NO Spring Security — that comes in the auth phase.
+    ================================================================ -->
+    <dependencies>
+
+        <!-- 1. Web: REST API + SSE support -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+
+        <!-- 2. JPA: Spring Data JPA + Hibernate 6 ORM -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-jpa</artifactId>
+        </dependency>
+
+        <!-- 3. PostgreSQL JDBC driver (runtime only — not needed at compile time) -->
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+
+        <!-- 4. Lombok — compile-time annotation processor, optional at runtime     -->
+        <!--    Version 1.18.38 required for Java 23/24/25 (fixes TypeTag::UNKNOWN) -->
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+            <version>1.18.38</version>
+            <optional>true</optional>
+        </dependency>
+
+        <!-- 5. DevTools — hot reload during development (runtime only) -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-devtools</artifactId>
+            <scope>runtime</scope>
+            <optional>true</optional>
+        </dependency>
+
+        <!-- 6. Test: JUnit 5 + Spring Test support -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- 7. Spring Security core — method security, filter chain, session mgmt -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-security</artifactId>
+        </dependency>
+
+        <!-- 8. GitHub OAuth2 Client — authorization code flow, token exchange -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-oauth2-client</artifactId>
+        </dependency>
+
+    </dependencies>
+
+    <!-- ================================================================
+         BUILD CONFIGURATION
+         Exclude Lombok from the final JAR — it is compile-time only.
+    ================================================================ -->
+    <build>
+        <plugins>
+            <!-- Lombok APT wiring: 1.18.38 required for JDK 25 (fixes TypeTag::UNKNOWN) -->
+            <!-- Produces Java 21 bytecode (release 21) so Spring Boot 3.2.5 plugin    -->
+            <!-- can load the classes (class file major version 65, not 69).            -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <configuration>
+                    <source>21</source>
+                    <target>21</target>
+                    <release>21</release>
+                    <annotationProcessorPaths>
+                        <path>
+                            <groupId>org.projectlombok</groupId>
+                            <artifactId>lombok</artifactId>
+                            <version>1.18.38</version>
+                        </path>
+                    </annotationProcessorPaths>
+                </configuration>
+            </plugin>
+
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+                <configuration>
+                    <excludes>
+                        <exclude>
+                            <groupId>org.projectlombok</groupId>
+                            <artifactId>lombok</artifactId>
+                        </exclude>
+                    </excludes>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+
+</project>
