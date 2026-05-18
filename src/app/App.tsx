@@ -1,5 +1,7 @@
+import { useEffect } from 'react';
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { AnimatePresence } from 'motion/react';
+import { useAuthStore } from '../store/authStore';
 
 // Pages
 import LandingPage from '../pages/LandingPage';
@@ -15,6 +17,12 @@ import NotFoundPage from '../pages/NotFoundPage';
 import ProtectedRoute from '../components/layout/ProtectedRoute';
 
 export default function App() {
+  const { fetchUser } = useAuthStore();
+
+  useEffect(() => {
+    fetchUser();
+  }, []);
+
   return (
     <BrowserRouter>
       <AnimatePresence mode="wait">

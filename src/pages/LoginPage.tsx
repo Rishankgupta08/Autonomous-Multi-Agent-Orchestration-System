@@ -1,18 +1,14 @@
 import { useState } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
+import { Link } from 'react-router-dom';
 import { motion } from 'motion/react';
 import ParticleBackground from '../components/background/ParticleBackground';
 import LogoSymbol from '../components/common/LogoSymbol';
 import Input from '../components/common/Input';
 import Button from '../components/common/Button';
 import { scaleIn } from '../lib/animations';
-import { useAuthStore } from '../store/authStore';
-import { useIntegrationStore } from '../store/integrationStore';
-import { MOCK_USER, MOCK_INTEGRATIONS } from '../lib/mockData';
+import { authApi } from '../lib/api';
 
 export default function LoginPage() {
-  const navigate = useNavigate();
-  const setUser = useAuthStore((state) => state.setUser);
   const [loading, setLoading] = useState(false);
   const [formData, setFormData] = useState({
     email: '',
@@ -21,32 +17,14 @@ export default function LoginPage() {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    setLoading(true);
-
-    await new Promise(resolve => setTimeout(resolve, 1000));
-
-    setUser(MOCK_USER, 'mock-token');
-
-    // Check if user has integrations (simulate returning user)
-    const hasIntegrations = true; // Mock: user has integrations
-    if (hasIntegrations) {
-      useIntegrationStore.getState().setGitHub(MOCK_INTEGRATIONS.github);
-      useIntegrationStore.getState().setJira(MOCK_INTEGRATIONS.jira);
-      useIntegrationStore.getState().setSlack(MOCK_INTEGRATIONS.slack);
-      navigate('/workflow');
-    } else {
-      navigate('/integrations');
-    }
+    // Email login not implemented in backend yet
+    alert("Please use GitHub to log in.");
   };
 
-  const handleGitHubOAuth = async () => {
+  const handleGitHubOAuth = () => {
     setLoading(true);
-    await new Promise(resolve => setTimeout(resolve, 1000));
-    setUser(MOCK_USER, 'mock-token');
-    useIntegrationStore.getState().setGitHub(MOCK_INTEGRATIONS.github);
-    useIntegrationStore.getState().setJira(MOCK_INTEGRATIONS.jira);
-    useIntegrationStore.getState().setSlack(MOCK_INTEGRATIONS.slack);
-    navigate('/workflow');
+    // Redirect browser to backend OAuth2 endpoint
+    window.location.href = authApi.loginUrl();
   };
 
   return (
@@ -76,7 +54,7 @@ export default function LoginPage() {
             variant="primary"
             fullWidth
             loading={loading}
-            loadingText="Authenticating..."
+            loadingText="Redirecting..."
             onClick={handleGitHubOAuth}
             iconLeft={
               <svg className="w-[18px] h-[18px]" fill="currentColor" viewBox="0 0 24 24">
@@ -103,7 +81,6 @@ export default function LoginPage() {
               placeholder="you@company.com"
               value={formData.email}
               onChange={(e) => setFormData({ ...formData, email: e.target.value })}
-              required
             />
 
             <Input
@@ -112,7 +89,6 @@ export default function LoginPage() {
               placeholder="Enter your password"
               value={formData.password}
               onChange={(e) => setFormData({ ...formData, password: e.target.value })}
-              required
             />
 
             <div className="text-right">
@@ -122,7 +98,7 @@ export default function LoginPage() {
             </div>
 
             <div className="pt-2">
-              <Button type="submit" variant="primary" fullWidth loading={loading} loadingText="Signing in...">
+              <Button type="button" variant="primary" fullWidth onClick={handleSubmit}>
                 Sign In
               </Button>
             </div>

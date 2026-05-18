@@ -54,14 +54,15 @@ public final class JsonExtractUtil {
      * @return clean JSON object string ready for ObjectMapper.readValue()
      * @throws RuntimeException if no '{' / '}' pair is found in the response
      */
-    public static String extractJsonObject(String rawLlmResponse) {
-        int firstIndex = rawLlmResponse.indexOf('{');
-        int lastIndex  = rawLlmResponse.lastIndexOf('}');
-
-        if (firstIndex == -1 || lastIndex == -1 || lastIndex < firstIndex) {
-            throw new RuntimeException(
-                "No JSON object found in LLM response: " + rawLlmResponse);
+    public static String extractJsonObject(String raw) {
+        if (raw == null || raw.isBlank()) {
+            return "{}";
         }
-        return rawLlmResponse.substring(firstIndex, lastIndex + 1);
+        int start = raw.indexOf('{');
+        int end   = raw.lastIndexOf('}');
+        if (start == -1 || end == -1 || end <= start) {
+            return "{}";
+        }
+        return raw.substring(start, end + 1);
     }
 }

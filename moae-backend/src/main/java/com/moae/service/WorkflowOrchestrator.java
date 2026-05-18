@@ -34,34 +34,38 @@ import java.util.UUID;
  * This class replaced the Step 4 stub in Step 6 with real agent calls.
  *
  * Execution model:
- *   POST /api/workflow/execute  → creates WorkflowRun (RUNNING), fires @Async
- *   GET  /api/workflow/stream   → frontend registers SSE channel
- *   @Async thread               → this method runs on Spring's thread pool
+ * POST /api/workflow/execute → creates WorkflowRun (RUNNING), fires @Async
+ * GET /api/workflow/stream → frontend registers SSE channel
+ * 
+ * @Async thread → this method runs on Spring's thread pool
  *
- * Phase breakdown:
- *   Phase 1 — Planning:     PlannerAgent generates the step plan + DB rows created
- *   Phase 2 — Execution:    ExecutorAgent runs each step + SSE substep_complete events
- *   Phase 3 — Verification: VerifierAgent scores the execution quality
- *   Phase 4 — Persist:      WorkflowRun updated with final status + DQ scores
- *   Phase 5 — Complete:     SSE workflow_complete event + emitter closed
+ *        Phase breakdown:
+ *        Phase 1 — Planning: PlannerAgent generates the step plan + DB rows
+ *        created
+ *        Phase 2 — Execution: ExecutorAgent runs each step + SSE
+ *        substep_complete events
+ *        Phase 3 — Verification: VerifierAgent scores the execution quality
+ *        Phase 4 — Persist: WorkflowRun updated with final status + DQ scores
+ *        Phase 5 — Complete: SSE workflow_complete event + emitter closed
  *
- * Error handling:
- *   Any unhandled exception from Phase 1–3 → caught by outer try-catch → failWorkflow()
- *   ExecutorAgent never throws — all step failures are handled internally.
- *   VerifierAgent never throws — has fallback return for all error paths.
+ *        Error handling:
+ *        Any unhandled exception from Phase 1–3 → caught by outer try-catch →
+ *        failWorkflow()
+ *        ExecutorAgent never throws — all step failures are handled internally.
+ *        VerifierAgent never throws — has fallback return for all error paths.
  */
 @Service
 @RequiredArgsConstructor
 @Slf4j
 public class WorkflowOrchestrator {
 
-    private final PlannerAgent            plannerAgent;
-    private final ExecutorAgent           executorAgent;
-    private final VerifierAgent           verifierAgent;
-    private final WorkflowRunRepository   workflowRunRepository;
-    private final WorkflowStepRepository  workflowStepRepository;
-    private final SseEmitterRegistry      sseEmitterRegistry;
-    private final ObjectMapper            objectMapper;
+    private final PlannerAgent plannerAgent;
+    private final ExecutorAgent executorAgent;
+    private final VerifierAgent verifierAgent;
+    private final WorkflowRunRepository workflowRunRepository;
+    private final WorkflowStepRepository workflowStepRepository;
+    private final SseEmitterRegistry sseEmitterRegistry;
+    private final ObjectMapper objectMapper;
     private final com.moae.client.JiraClient jiraClient;
     private final UserIntegrationRepository userIntegrationRepository;
 
@@ -69,9 +73,11 @@ public class WorkflowOrchestrator {
      * Executes the full pipeline on a Spring @Async thread pool thread.
      * Returns void — all output via SSE events and DB writes.
      *
-     * @param workflowId string UUID of the WorkflowRun (already persisted as RUNNING)
+     * @param workflowId string UUID of the WorkflowRun (already persisted as
+     *                   RUNNING)
      * @param goal       the raw natural language goal string
-     * @param userId     UUID of the authenticated user (used by ExecutorAgent for credentials)
+     * @param userId     UUID of the authenticated user (used by ExecutorAgent for
+     *                   credentials)
      */
     @Async
     public void executeWorkflow(String workflowId, String message, UUID userId) {
@@ -81,22 +87,21 @@ public class WorkflowOrchestrator {
             // ── PHASE 1: PLANNING ─────────────────────────────────────────────
 
             WorkflowRun run = workflowRunRepository
-                .findById(UUID.fromString(workflowId))
-                .orElseThrow(() -> new RuntimeException("WorkflowRun not found: " + workflowId));
+                    .findById(UUID.fromString(workflowId))
+                    .orElseThrow(() -> new RuntimeException("WorkflowRun not found: " + workflowId));
 
             sseEmitterRegistry.send(workflowId, "log",
-                Map.of("msg", "Analysing your request...", "cls", "ok"));
+                    Map.of("msg", "Analysing your request...", "cls", "ok"));
 
             List<Map<String, Object>> plan = plannerAgent.planFromNaturalLanguage(
-                message,
-                jiraClient,
-                userIntegrationRepository,
-                userId,
-                objectMapper
-            );
+                    message,
+                    jiraClient,
+                    userIntegrationRepository,
+                    userId,
+                    objectMapper);
 
             sseEmitterRegistry.send(workflowId, "log",
-                Map.of("msg", "Plan ready — " + plan.size() + " steps", "cls", "ok"));
+                    Map.of("msg", "Plan ready — " + plan.size() + " steps", "cls", "ok"));
 
             // Create ALL WorkflowStep rows as PENDING before execution starts
             for (int i = 0; i < plan.size(); i++) {
@@ -123,31 +128,34 @@ public class WorkflowOrchestrator {
 
             sseEmitterRegistry.send(workflowId, "plan_ready", Map.of("steps", plan));
             sseEmitterRegistry.send(workflowId, "log",
-                Map.of("msg", "Plan generated with " + plan.size() + " steps. Starting execution...",
-                       "cls", "ok"));
+                    Map.of("msg", "Plan generated with " + plan.size() + " steps. Starting execution...",
+                            "cls", "ok"));
 
             // ── PHASE 2: EXECUTION ────────────────────────────────────────────
 
             List<StepResult> stepResults = executorAgent.execute(
-                plan, run.getId(), userId, workflowId);
+                    plan, run.getId(), userId, workflowId);
 
             sseEmitterRegistry.send(workflowId, "log",
-                Map.of("msg", "Execution complete. Starting verification...", "cls", "ok"));
+                    Map.of("msg", "Execution complete. Starting verification...", "cls", "ok"));
 
             // ── PHASE 3: VERIFICATION ─────────────────────────────────────────
 
             VerificationResult verification = verifierAgent.verify(message, stepResults);
 
             // ── PHASE 4: PERSIST FINAL STATE ──────────────────────────────────
-            
+
             // Check if any step was a successful PR creation
             String prUrl = null;
             Integer prNumber = null;
             for (StepResult sr : stepResults) {
-                if ("github".equals(sr.getTool()) && "createPR".equals(sr.getAction()) && StepStatus.SUCCESS.equals(sr.getStatus())) {
+                if ("github".equals(sr.getTool()) && "createPR".equals(sr.getAction())
+                        && StepStatus.SUCCESS.equals(sr.getStatus())) {
                     if (sr.getResultJson() != null) {
                         try {
-                            Map<String, Object> prData = objectMapper.readValue(sr.getResultJson(), new com.fasterxml.jackson.core.type.TypeReference<>() {});
+                            Map<String, Object> prData = objectMapper.readValue(sr.getResultJson(),
+                                    new com.fasterxml.jackson.core.type.TypeReference<>() {
+                                    });
                             prUrl = (String) prData.get("prUrl");
                             prNumber = (Integer) prData.get("prNumber");
                         } catch (Exception e) {
@@ -159,14 +167,14 @@ public class WorkflowOrchestrator {
 
             WorkflowStatus finalStatus;
             if (prUrl != null || prNumber != null) {
-                finalStatus = WorkflowStatus.AWAITING_MERGE;
+                finalStatus = WorkflowStatus.COMPLETED;
                 run.setPrUrl(prUrl);
                 run.setPrNumber(prNumber);
                 run.setPrMerged(false);
             } else {
-                finalStatus = "SUCCESS".equals(verification.getVerdict()) 
-                    ? WorkflowStatus.SUCCESS 
-                    : WorkflowStatus.FAILED;
+                finalStatus = "SUCCESS".equals(verification.getVerdict())
+                        ? WorkflowStatus.SUCCESS
+                        : WorkflowStatus.FAILED;
             }
 
             run.setStatus(finalStatus);
@@ -182,17 +190,21 @@ public class WorkflowOrchestrator {
             // ── PHASE 5: EMIT WORKFLOW_COMPLETE + CLOSE SSE ───────────────────
 
             Map<String, Object> completePayload = new HashMap<>();
-            completePayload.put("workflowId",    workflowId);
-            completePayload.put("overallStatus",  verification.getVerdict());
-            completePayload.put("score",          verification.getOverallScore());
-            completePayload.put("summary",        verification.getSummary());
-            completePayload.put("results",        buildStepResultsPayload(stepResults));
+            completePayload.put("workflowId", workflowId);
+            completePayload.put("overallStatus", verification.getVerdict());
+            completePayload.put("score", verification.getOverallScore());
+            completePayload.put("taskCompletion", verification.getTaskCompletion());
+            completePayload.put("decisionAccuracy", verification.getDecisionAccuracy());
+            completePayload.put("executionEfficiency", verification.getExecutionEfficiency());
+            completePayload.put("contextRelevance", verification.getContextRelevance());
+            completePayload.put("summary", verification.getSummary());
+            completePayload.put("results", buildStepResultsPayload(stepResults));
 
             sseEmitterRegistry.send(workflowId, "workflow_complete", completePayload);
             sseEmitterRegistry.complete(workflowId);
 
             log.info("Workflow {} completed → {} | score: {}",
-                workflowId, verification.getVerdict(), verification.getOverallScore());
+                    workflowId, verification.getVerdict(), verification.getOverallScore());
 
         } catch (Exception e) {
             log.error("FULL STACKTRACE", e);
@@ -206,7 +218,8 @@ public class WorkflowOrchestrator {
 
     /**
      * Called when an unhandled exception escapes Phase 1–3.
-     * Persists FAILED status, emits a FAIL workflow_complete SSE event, closes emitter.
+     * Persists FAILED status, emits a FAIL workflow_complete SSE event, closes
+     * emitter.
      * Safe to call even if the DB update fails (wrapped in its own try-catch).
      */
     private void failWorkflow(String workflowId, Exception e) {
@@ -227,27 +240,29 @@ public class WorkflowOrchestrator {
 
         // Always emit workflow_complete so the frontend doesn't hang waiting
         sseEmitterRegistry.send(workflowId, "workflow_complete",
-            Map.of("overallStatus", "FAIL",
-                   "score",         0,
-                   "summary",       "Workflow failed: " + e.getMessage()));
+                Map.of("overallStatus", "FAIL",
+                        "score", 0,
+                        "summary", "Workflow failed: " + e.getMessage()));
         sseEmitterRegistry.complete(workflowId);
     }
 
     /**
-     * Builds the lightweight step summary payload for the workflow_complete SSE event.
+     * Builds the lightweight step summary payload for the workflow_complete SSE
+     * event.
      * Excludes large fields (resultJson, paramsJson) — those are in DB only.
      */
     private List<Map<String, Object>> buildStepResultsPayload(List<StepResult> results) {
         List<Map<String, Object>> payload = new ArrayList<>();
         for (StepResult result : results) {
             Map<String, Object> entry = new HashMap<>();
-            entry.put("stepId",        result.getStepId());
-            entry.put("tool",          result.getTool());
-            entry.put("action",        result.getAction());
-            entry.put("status",        result.getStatus().name());
-            entry.put("timeTakenMs",   result.getTimeTakenMs());
+            entry.put("stepId", result.getStepId());
+            entry.put("tool", result.getTool());
+            entry.put("action", result.getAction());
+            entry.put("status", result.getStatus().name());
+            entry.put("timeTakenMs", result.getTimeTakenMs());
             entry.put("failureReason", result.getFailureReason() != null
-                ? result.getFailureReason().name() : null);
+                    ? result.getFailureReason().name()
+                    : null);
             payload.add(entry);
         }
         return payload;
@@ -255,7 +270,8 @@ public class WorkflowOrchestrator {
 
     private Map<String, Object> parseConfigJson(String configJson) {
         try {
-            return objectMapper.readValue(configJson, new com.fasterxml.jackson.core.type.TypeReference<>() {});
+            return objectMapper.readValue(configJson, new com.fasterxml.jackson.core.type.TypeReference<>() {
+            });
         } catch (JsonProcessingException e) {
             throw new RuntimeException("Failed to parse integration config JSON: " + e.getMessage(), e);
         }

@@ -1,6 +1,7 @@
 package com.moae.controller;
 
 import com.moae.dto.DQScoreDTO;
+import com.moae.dto.MergeConfirmRequest;
 import com.moae.dto.WorkflowDetailDTO;
 import com.moae.dto.WorkflowExecuteRequest;
 import com.moae.dto.WorkflowExecuteResponse;
@@ -14,6 +15,7 @@ import com.moae.enums.WorkflowStatus;
 import com.moae.repository.UserRepository;
 import com.moae.repository.WorkflowRunRepository;
 import com.moae.repository.WorkflowStepRepository;
+import com.moae.service.MergeConfirmService;
 import com.moae.service.WorkflowOrchestrator;
 import com.moae.sse.SseEmitterRegistry;
 import com.moae.util.SessionUtil;
@@ -68,6 +70,7 @@ public class WorkflowController {
     private final WorkflowOrchestrator   workflowOrchestrator;
     private final SseEmitterRegistry     sseEmitterRegistry;
     private final UserRepository         userRepository;
+    private final MergeConfirmService    mergeConfirmService;
 
     // ─────────────────────────────────────────────────────────────────────────
     // STEP 4: POST /api/workflow/execute
@@ -303,6 +306,21 @@ public class WorkflowController {
                 .build();
 
         return ResponseEntity.ok(detail);
+    }
+
+    @PostMapping("/{workflowId}/confirm-merge")
+    public ResponseEntity<?> confirmMerge(
+            @PathVariable String workflowId,
+            @RequestBody MergeConfirmRequest request,
+            HttpSession session) {
+
+        UUID userId = SessionUtil.getUserId(session);
+        UUID wfId   = UUID.fromString(workflowId);
+
+        Map<String, Object> result = mergeConfirmService.confirmMerge(
+                wfId, userId, request.isMerged());
+
+        return ResponseEntity.ok(result);
     }
 
     // ─────────────────────────────────────────────────────────────────────────

@@ -1,17 +1,14 @@
 import { useState } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
+import { Link } from 'react-router-dom';
 import { motion } from 'motion/react';
 import ParticleBackground from '../components/background/ParticleBackground';
 import LogoSymbol from '../components/common/LogoSymbol';
 import Input from '../components/common/Input';
 import Button from '../components/common/Button';
 import { scaleIn } from '../lib/animations';
-import { useAuthStore } from '../store/authStore';
-import { MOCK_USER } from '../lib/mockData';
+import { authApi } from '../lib/api';
 
 export default function SignUpPage() {
-  const navigate = useNavigate();
-  const setUser = useAuthStore((state) => state.setUser);
   const [loading, setLoading] = useState(false);
   const [formData, setFormData] = useState({
     name: '',
@@ -22,20 +19,14 @@ export default function SignUpPage() {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    setLoading(true);
-
-    // Simulate API call
-    await new Promise(resolve => setTimeout(resolve, 1000));
-
-    setUser(MOCK_USER, 'mock-token');
-    navigate('/integrations');
+    // Email signup not implemented in backend yet
+    alert("Please use GitHub to sign up.");
   };
 
-  const handleGitHubOAuth = async () => {
+  const handleGitHubOAuth = () => {
     setLoading(true);
-    await new Promise(resolve => setTimeout(resolve, 1000));
-    setUser(MOCK_USER, 'mock-token');
-    navigate('/integrations');
+    // Redirect browser to backend OAuth2 endpoint
+    window.location.href = authApi.loginUrl();
   };
 
   return (
@@ -65,7 +56,7 @@ export default function SignUpPage() {
             variant="primary"
             fullWidth
             loading={loading}
-            loadingText="Creating account..."
+            loadingText="Redirecting..."
             onClick={handleGitHubOAuth}
             iconLeft={
               <svg className="w-[18px] h-[18px]" fill="currentColor" viewBox="0 0 24 24">
@@ -91,7 +82,6 @@ export default function SignUpPage() {
               placeholder="Your full name"
               value={formData.name}
               onChange={(e) => setFormData({ ...formData, name: e.target.value })}
-              required
             />
 
             <div className="relative">
@@ -102,7 +92,6 @@ export default function SignUpPage() {
                 value={formData.username}
                 onChange={(e) => setFormData({ ...formData, username: e.target.value })}
                 className="pl-6"
-                required
               />
               <span className="absolute left-3 top-[38px] text-[14px] text-[#555] font-mono">@</span>
             </div>
@@ -113,7 +102,6 @@ export default function SignUpPage() {
               placeholder="you@company.com"
               value={formData.email}
               onChange={(e) => setFormData({ ...formData, email: e.target.value })}
-              required
             />
 
             <Input
@@ -122,11 +110,10 @@ export default function SignUpPage() {
               placeholder="Choose a strong password"
               value={formData.password}
               onChange={(e) => setFormData({ ...formData, password: e.target.value })}
-              required
             />
 
             <div className="pt-4">
-              <Button type="submit" variant="primary" fullWidth loading={loading} loadingText="Creating account...">
+              <Button type="button" variant="primary" fullWidth onClick={handleSubmit}>
                 Create Account
               </Button>
             </div>

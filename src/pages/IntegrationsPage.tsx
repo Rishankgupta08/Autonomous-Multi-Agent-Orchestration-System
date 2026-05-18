@@ -1,47 +1,47 @@
 import { useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { motion } from 'motion/react';
-import { useIntegrationStore } from '../store/integrationStore';
 import { useAuthStore } from '../store/authStore';
+import { useIntegrationStore } from '../store/integrationStore';
 import Input from '../components/common/Input';
 import Button from '../components/common/Button';
 import StatusChip from '../components/common/StatusChip';
 import { fadeUp, staggerContainer } from '../lib/animations';
+import { Loader2 } from 'lucide-react';
 
 export default function IntegrationsPage() {
   const navigate = useNavigate();
   const { user } = useAuthStore();
-  const { github, jira, slack, setJira, setSlack } = useIntegrationStore();
+  const {
+    jiraLoading, slackLoading,
+    jiraError, slackError,
+    connectJira, disconnectJira,
+    connectSlack, disconnectSlack,
+  } = useIntegrationStore();
+
+  const jiraConnected = user?.jiraConnected ?? false;
+  const slackConnected = user?.slackConnected ?? false;
 
   const [jiraData, setJiraData] = useState({ domain: '', email: '', token: '' });
   const [slackData, setSlackData] = useState({ botToken: '' });
-  const [jiraLoading, setJiraLoading] = useState(false);
-  const [slackLoading, setSlackLoading] = useState(false);
 
-  const handleJiraConnect = async () => {
-    setJiraLoading(true);
-    await new Promise(resolve => setTimeout(resolve, 1200));
-    setJira({
-      connected: true,
-      domain: jiraData.domain,
-      displayName: 'Rishank Gupta',
-      accountId: 'acc_5f92b'
-    });
-    setJiraLoading(false);
+  const handleJiraConnect = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const success = await connectJira({ domain: jiraData.domain, email: jiraData.email, apiToken: jiraData.token });
+    if (success) {
+      setJiraData({ domain: '', email: '', token: '' });
+    }
   };
 
-  const handleSlackConnect = async () => {
-    setSlackLoading(true);
-    await new Promise(resolve => setTimeout(resolve, 1200));
-    setSlack({
-      connected: true,
-      teamName: 'Galgotias Dev',
-      botName: 'moae-bot'
-    });
-    setSlackLoading(false);
+  const handleSlackConnect = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const success = await connectSlack({ botToken: slackData.botToken });
+    if (success) {
+      setSlackData({ botToken: '' });
+    }
   };
 
-  const allConnected = jira.connected && slack.connected;
+  const allConnected = jiraConnected && slackConnected;
 
   return (
     <div className="min-h-screen bg-[#080808] px-6 py-16">
@@ -81,12 +81,12 @@ export default function IntegrationsPage() {
           <svg className="w-4 h-4" style={{ color: '#22C55E' }} fill="currentColor" viewBox="0 0 24 24">
             <path fillRule="evenodd" d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z" clipRule="evenodd" />
           </svg>
-          <span className="text-[13px] font-mono text-[#888]">github.com/{user?.username}</span>
+          <span className="text-[13px] font-mono text-[#888]">github.com/{user?.githubLogin}</span>
           <StatusChip variant="connected-green" />
         </motion.div>
 
         {/* Jira Integration */}
-        <motion.div variants={fadeUp} className={`glass-card p-6 mb-6 ${jira.connected ? 'glass-card--blue' : ''}`}>
+        <motion.div variants={fadeUp} className={`glass-card p-6 mb-6 ${jiraConnected ? 'glass-card--blue' : ''}`}>
           <div className="flex items-start justify-between mb-5">
             <div className="flex items-center gap-3">
               <svg className="w-6 h-6" style={{ color: '#2D8EFF' }} viewBox="0 0 24 24" fill="currentColor">
@@ -97,18 +97,19 @@ export default function IntegrationsPage() {
                 <p className="text-[13px] text-[#555]">Atlassian</p>
               </div>
             </div>
-            <StatusChip variant={jira.connected ? 'connected-blue' : 'disconnected'} />
+            <StatusChip variant={jiraConnected ? 'connected-blue' : 'disconnected'} />
           </div>
 
           <div className="h-px bg-[rgba(255,255,255,0.06)] mb-5" />
 
-          {!jira.connected ? (
-            <div className="space-y-3">
+          {!jiraConnected ? (
+            <form onSubmit={handleJiraConnect} className="space-y-3">
               <Input
                 label="Jira Domain"
                 placeholder="yourcompany.atlassian.net"
                 value={jiraData.domain}
                 onChange={(e) => setJiraData({ ...jiraData, domain: e.target.value })}
+                required
               />
               <Input
                 label="Account Email"
@@ -116,6 +117,7 @@ export default function IntegrationsPage() {
                 placeholder="you@company.com"
                 value={jiraData.email}
                 onChange={(e) => setJiraData({ ...jiraData, email: e.target.value })}
+                required
               />
               <div>
                 <Input
@@ -125,6 +127,7 @@ export default function IntegrationsPage() {
                   placeholder="••••••••••••••••"
                   value={jiraData.token}
                   onChange={(e) => setJiraData({ ...jiraData, token: e.target.value })}
+                  required
                 />
                 <a
                   href="https://id.atlassian.com/manage-profile/security/api-tokens"
@@ -135,27 +138,32 @@ export default function IntegrationsPage() {
                   Generate API token →
                 </a>
               </div>
+              {jiraError && <p className="text-[13px] text-red-400 mt-2">{jiraError}</p>}
               <div className="pt-2">
                 <Button
+                  type="submit"
                   variant="blue"
                   fullWidth
-                  onClick={handleJiraConnect}
-                  loading={jiraLoading}
-                  loadingText="Verifying connection..."
+                  disabled={jiraLoading}
                 >
-                  Connect Jira
+                  {jiraLoading ? <Loader2 className="animate-spin mx-auto" size={14} /> : 'Connect Jira'}
                 </Button>
               </div>
-            </div>
+            </form>
           ) : (
-            <p className="text-[12px] text-[#555] font-mono">
-              Connected as Rishank Gupta · acc_5f92b
-            </p>
+            <div className="flex items-center justify-between">
+              <p className="text-[12px] text-[#555] font-mono">
+                Connected
+              </p>
+              <Button type="button" variant="ghost" onClick={() => disconnectJira()} className="!h-8 !text-[12px] !text-red-400 hover:!bg-red-400/10">
+                Disconnect
+              </Button>
+            </div>
           )}
         </motion.div>
 
         {/* Slack Integration */}
-        <motion.div variants={fadeUp} className={`glass-card p-6 ${slack.connected ? 'glass-card--purple' : ''}`}>
+        <motion.div variants={fadeUp} className={`glass-card p-6 ${slackConnected ? 'glass-card--purple' : ''}`}>
           <div className="flex items-start justify-between mb-5">
             <div className="flex items-center gap-3">
               <svg className="w-6 h-6" style={{ color: '#7C3AED' }} viewBox="0 0 24 24" fill="currentColor">
@@ -166,13 +174,13 @@ export default function IntegrationsPage() {
                 <p className="text-[13px] text-[#555]">Workspace Bot</p>
               </div>
             </div>
-            <StatusChip variant={slack.connected ? 'connected-purple' : 'disconnected'} />
+            <StatusChip variant={slackConnected ? 'connected-purple' : 'disconnected'} />
           </div>
 
           <div className="h-px bg-[rgba(255,255,255,0.06)] mb-5" />
 
-          {!slack.connected ? (
-            <div className="space-y-3">
+          {!slackConnected ? (
+            <form onSubmit={handleSlackConnect} className="space-y-3">
               <div>
                 <Input
                   label="Bot Token"
@@ -181,6 +189,7 @@ export default function IntegrationsPage() {
                   placeholder="xoxb-••••-••••-••••-••••••••••••"
                   value={slackData.botToken}
                   onChange={(e) => setSlackData({ ...slackData, botToken: e.target.value })}
+                  required
                 />
                 <div className="mt-1 space-y-1">
                   <a
@@ -193,22 +202,27 @@ export default function IntegrationsPage() {
                   </a>
                 </div>
               </div>
+              {slackError && <p className="text-[13px] text-red-400 mt-2">{slackError}</p>}
               <div className="pt-2">
                 <Button
+                  type="submit"
                   variant="purple"
                   fullWidth
-                  onClick={handleSlackConnect}
-                  loading={slackLoading}
-                  loadingText="Verifying connection..."
+                  disabled={slackLoading}
                 >
-                  Connect Slack
+                  {slackLoading ? <Loader2 className="animate-spin mx-auto" size={14} /> : 'Connect Slack'}
                 </Button>
               </div>
-            </div>
+            </form>
           ) : (
-            <p className="text-[12px] text-[#555] font-mono">
-              Connected to Galgotias Dev · Bot: moae-bot
-            </p>
+            <div className="flex items-center justify-between">
+              <p className="text-[12px] text-[#555] font-mono">
+                Connected
+              </p>
+              <Button type="button" variant="ghost" onClick={() => disconnectSlack()} className="!h-8 !text-[12px] !text-red-400 hover:!bg-red-400/10">
+                Disconnect
+              </Button>
+            </div>
           )}
         </motion.div>
 
