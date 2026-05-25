@@ -15,6 +15,7 @@ import org.springframework.web.client.HttpServerErrorException;
 import org.springframework.web.client.ResourceAccessException;
 import org.springframework.web.client.RestTemplate;
 
+import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
 import java.util.HashMap;
@@ -88,16 +89,35 @@ public class JiraClient {
      * Jira REST API v3 rejects plain strings; the nested doc/paragraph/text
      * structure is required.
      *
-     * @param domain      Jira subdomain (e.g. "myteam" → myteam.atlassian.net)
-     * @param email       Jira account email
-     * @param apiToken    Jira API token
-     * @param projectKey  Jira project key (e.g. "PROJ")
-     * @param summary     one-line issue title
-     * @param description body text (wrapped in ADF by this method)
+     * Assignee resolution uses Jira's fuzzy {@code /user/assignable/search}
+     * endpoint, which matches on display name, email, and username simultaneously.
+     * Examples: "Rishank", "rish", "rishank@email.com" all resolve correctly.
+     * If resolution fails for any reason, the ticket is created unassigned — this
+     * is NOT an error.
+     *
+     * @param domain              Jira subdomain (e.g. "myteam" →
+     *                            myteam.atlassian.net)
+     * @param email               Jira account email (used for auth)
+     * @param apiToken            Jira API token
+     * @param projectKey          Jira project key (e.g. "PROJ")
+     * @param summary             one-line issue title
+     * @param description         body text (wrapped in ADF by this method)
+     * @param assigneeNameOrEmail display name or email to assign; null/blank →
+     *                            unassigned
      * @return created issue key
      */
+    @SuppressWarnings("unchecked")
     public String createTicket(String domain, String email, String apiToken,
-            String projectKey, String summary, String description) {
+            String projectKey, String summary, String description, String assigneeEmail) {
+
+        // ── Step A: Resolve assignee by email / name (best-effort) ────────────
+        String accountId = null;
+        if (assigneeEmail != null && !assigneeEmail.isBlank()) {
+            accountId = resolveAssigneeAccountId(
+                    assigneeEmail, projectKey, domain, email, apiToken);
+        }
+
+        // ── Step B: Build fields map ───────────────────────────────────────────
         String url = "https://" + domain + ".atlassian.net/rest/api/3/issue";
 
         Map<String, Object> textNode = Map.of("type", "text", "text", description);
@@ -105,19 +125,26 @@ public class JiraClient {
         Map<String, Object> adfDesc = Map.of("type", "doc", "version", 1,
                 "content", List.of(paragraphNode));
 
-        Map<String, Object> fields = Map.of(
-                "project", Map.of("key", projectKey),
-                "summary", summary,
-                "issuetype", Map.of("name", "Task"),
-                "description", adfDesc);
+        Map<String, Object> fields = new HashMap<>();
+        fields.put("project", Map.of("key", projectKey));
+        fields.put("summary", summary);
+        fields.put("issuetype", Map.of("name", "Task"));
+        fields.put("description", adfDesc);
+        if (accountId != null) {
+            fields.put("assignee", Map.of("accountId", accountId));
+        }
+
         Map<String, Object> requestBody = Map.of("fields", fields);
 
+        // ── Step C: Create the ticket ──────────────────────────────────────────
         try {
             HttpEntity<Map<String, Object>> entity = new HttpEntity<>(requestBody, buildJiraHeaders(email, apiToken));
             ResponseEntity<Map> response = restTemplate.exchange(
                     url, HttpMethod.POST, entity, Map.class);
             String issueKey = (String) response.getBody().get("key");
-            log.info("Jira createTicket: created {} in project {}", issueKey, projectKey);
+            log.info("Jira createTicket: created {} in project {} (assignee={})",
+                    issueKey, projectKey,
+                    accountId != null ? assigneeEmail : "unassigned");
             return issueKey;
         } catch (HttpClientErrorException e) {
             handleClientError(e, "createTicket");
@@ -128,6 +155,189 @@ public class JiraClient {
         }
 
         throw new IllegalStateException("Unreachable — error handlers always throw");
+    }
+
+    /**
+     * Resolves a display name or email address to a Jira accountId using the
+     * {@code /user/assignable/search} endpoint.
+     *
+     * <p>
+     * This endpoint performs fuzzy matching across display name, email address,
+     * and Jira username simultaneously. It is scoped to users who can be assigned
+     * issues in the given project, so it is both accurate and permission-aware.
+     *
+     * <p>
+     * All exceptions are swallowed — the caller creates the ticket unassigned
+     * on any failure. This is intentional: assignee resolution must never block
+     * ticket creation.
+     *
+     * @param nameOrEmail display name or email supplied by the user (e.g.
+     *                    "Rishank")
+     * @param projectKey  Jira project key used to scope the search (e.g. "EC")
+     * @param domain      Jira subdomain
+     * @param authEmail   Jira account email for Basic Auth
+     * @param apiToken    Jira API token for Basic Auth
+     * @return accountId string, or {@code null} if not found or on any error
+     */
+    private String resolveAssigneeAccountId(String nameOrEmail, String projectKey,
+            String domain, String authEmail, String apiToken) {
+        String baseUrl = "https://" + domain + ".atlassian.net";
+        HttpHeaders headers = buildJiraHeaders(authEmail, apiToken);
+
+        // Step 1 — assignable/search with full input (display names always visible)
+        String accountId = searchViaAssignable(nameOrEmail, projectKey, baseUrl, headers);
+        if (accountId != null) return accountId;
+
+        // Step 2 — If email, try the username prefix (e.g. "rishankgutpa567")
+        if (nameOrEmail.contains("@")) {
+            String usernamePart = nameOrEmail.split("@")[0];
+            accountId = searchViaAssignable(usernamePart, projectKey, baseUrl, headers);
+            if (accountId != null) return accountId;
+        }
+
+        // Step 3 — user/picker GDPR-safe fuzzy search
+        accountId = searchViaUserPicker(nameOrEmail, baseUrl, headers);
+        if (accountId != null) return accountId;
+
+        // Step 4 — Full project member scan, match by displayName
+        accountId = searchByDisplayName(nameOrEmail, projectKey, baseUrl, headers);
+        if (accountId != null) return accountId;
+
+        log.warn("No assignable Jira user found for '{}' in project={} — ticket will be unassigned",
+                nameOrEmail, projectKey);
+        return null;
+    }
+
+    /**
+     * Full project-member scan that matches by {@code displayName} substring.
+     * Jira Cloud GDPR privacy hides {@code emailAddress} in all user search
+     * responses, but {@code displayName} is always visible. This is the definitive
+     * fallback for email-based lookups when all faster steps fail.
+     */
+    @SuppressWarnings("unchecked")
+    private String searchByDisplayName(String nameOrEmail, String projectKey,
+            String baseUrl, HttpHeaders headers) {
+        try {
+            // Extract a searchable name token: strip non-alpha from the username prefix
+            // e.g. "rishankgutpa567@gmail.com" → "rishankgutpa"
+            String searchName = nameOrEmail.contains("@")
+                    ? nameOrEmail.split("@")[0].replaceAll("[^a-zA-Z]", " ").trim()
+                    : nameOrEmail;
+
+            int startAt = 0;
+            final int PAGE_SIZE = 50;
+
+            while (true) {
+                String url = baseUrl + "/rest/api/3/user/assignable/search?project="
+                        + URLEncoder.encode(projectKey, StandardCharsets.UTF_8)
+                        + "&startAt=" + startAt
+                        + "&maxResults=" + PAGE_SIZE;
+
+                ResponseEntity<List> response = restTemplate.exchange(
+                        url, HttpMethod.GET,
+                        new HttpEntity<>(headers), List.class);
+
+                List<Map<String, Object>> users = response.getBody();
+                if (users == null || users.isEmpty()) break;
+
+                for (Map<String, Object> user : users) {
+                    String displayName = (String) user.get("displayName");
+                    String visibleEmail = (String) user.get("emailAddress"); // may be null (GDPR)
+
+                    boolean emailMatch = visibleEmail != null
+                            && visibleEmail.equalsIgnoreCase(nameOrEmail);
+                    boolean nameMatch = displayName != null
+                            && displayName.toLowerCase().contains(searchName.toLowerCase());
+
+                    if (emailMatch || nameMatch) {
+                        String accountId = (String) user.get("accountId");
+                        log.info("displayName scan resolved '{}' → accountId={} (displayName='{}')",
+                                nameOrEmail, accountId, displayName);
+                        return accountId;
+                    }
+                }
+
+                if (users.size() < PAGE_SIZE) break;
+                startAt += PAGE_SIZE;
+            }
+        } catch (Exception e) {
+            log.warn("displayName scan failed for '{}': {}", nameOrEmail, e.getMessage());
+        }
+        return null;
+    }
+
+    /**
+     * Exact email lookup via {@code /user/search}. This is the fastest and most
+     * precise resolution path when the caller supplies a full email address.
+     */
+    @SuppressWarnings("unchecked")
+    private String searchViaUserSearch(String email, String baseUrl, HttpHeaders headers) {
+        try {
+            String url = baseUrl + "/rest/api/3/user/search?query="
+                    + URLEncoder.encode(email, StandardCharsets.UTF_8)
+                    + "&maxResults=5";
+
+            ResponseEntity<List> response = restTemplate.exchange(
+                    url, HttpMethod.GET,
+                    new HttpEntity<>(headers), List.class);
+
+            List<Map<String, Object>> users = response.getBody();
+            if (users != null && !users.isEmpty()) {
+                String accountId = (String) users.get(0).get("accountId");
+                log.info("user/search resolved '{}' → accountId={}", email, accountId);
+                return accountId;
+            }
+        } catch (Exception e) {
+            log.warn("user/search lookup failed for '{}': {}", email, e.getMessage());
+        }
+        return null;
+    }
+
+    @SuppressWarnings("unchecked")
+    private String searchViaUserPicker(String query, String baseUrl, HttpHeaders headers) {
+        try {
+            String url = baseUrl + "/rest/api/3/user/picker?query="
+                    + URLEncoder.encode(query, StandardCharsets.UTF_8)
+                    + "&maxResults=5";
+
+            ResponseEntity<Map> response = restTemplate.exchange(
+                    url, HttpMethod.GET,
+                    new HttpEntity<>(headers), Map.class);
+
+            List<Map<String, Object>> users = (List<Map<String, Object>>) response.getBody().get("users");
+            if (users != null && !users.isEmpty()) {
+                String accountId = (String) users.get(0).get("accountId");
+                log.info("user/picker resolved '{}' → accountId={}", query, accountId);
+                return accountId;
+            }
+        } catch (Exception e) {
+            log.warn("user/picker lookup failed for '{}': {}", query, e.getMessage());
+        }
+        return null;
+    }
+
+    @SuppressWarnings("unchecked")
+    private String searchViaAssignable(String query, String projectKey, String baseUrl, HttpHeaders headers) {
+        try {
+            String url = baseUrl + "/rest/api/3/user/assignable/search?project="
+                    + URLEncoder.encode(projectKey, StandardCharsets.UTF_8) + "&query="
+                    + URLEncoder.encode(query, StandardCharsets.UTF_8)
+                    + "&maxResults=5";
+
+            ResponseEntity<List> response = restTemplate.exchange(
+                    url, HttpMethod.GET,
+                    new HttpEntity<>(headers), List.class);
+
+            List<Map<String, Object>> users = response.getBody();
+            if (users != null && !users.isEmpty()) {
+                String accountId = (String) users.get(0).get("accountId");
+                log.info("assignable/search resolved '{}' → accountId={}", query, accountId);
+                return accountId;
+            }
+        } catch (Exception e) {
+            log.warn("assignable/search failed for '{}': {}", query, e.getMessage());
+        }
+        return null;
     }
 
     /**

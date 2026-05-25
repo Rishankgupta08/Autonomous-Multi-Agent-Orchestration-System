@@ -20,25 +20,25 @@ import java.util.Map;
 public class OllamaClient {
 
     private final RestTemplate restTemplate;
-    private final String       baseUrl;
-    private final String       apiKey;
-    private final String       defaultModel;
-    private final String       siteUrl;
-    private final String       siteName;
+    private final String baseUrl;
+    private final String apiKey;
+    private final String defaultModel;
+    private final String siteUrl;
+    private final String siteName;
 
     public OllamaClient(
             @Qualifier("ollamaRestTemplate") RestTemplate restTemplate,
             @Value("${moae.openrouter.base-url}") String baseUrl,
-            @Value("${moae.openrouter.api-key}")  String apiKey,
-            @Value("${moae.openrouter.model}")    String defaultModel,
+            @Value("${moae.openrouter.api-key}") String apiKey,
+            @Value("${moae.openrouter.model}") String defaultModel,
             @Value("${moae.openrouter.site-url}") String siteUrl,
             @Value("${moae.openrouter.site-name}") String siteName) {
         this.restTemplate = restTemplate;
-        this.baseUrl      = baseUrl;
-        this.apiKey       = apiKey;
+        this.baseUrl = baseUrl;
+        this.apiKey = apiKey;
         this.defaultModel = defaultModel;
-        this.siteUrl      = siteUrl;
-        this.siteName     = siteName;
+        this.siteUrl = siteUrl;
+        this.siteName = siteName;
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -51,7 +51,8 @@ public class OllamaClient {
 
     public String generate(String prompt, String model) {
         String modelToUse = (model != null && !model.isBlank())
-                ? model : defaultModel;
+                ? model
+                : defaultModel;
 
         log.info("OLLAMA/OPENROUTER GENERATE STARTED | model={}", modelToUse);
         log.debug("OpenRouter generate | model={} | prompt[:100]={}",
@@ -67,8 +68,7 @@ public class OllamaClient {
         requestBody.put("model", modelToUse);
         requestBody.put("messages", List.of(message));
 
-        HttpEntity<Map<String, Object>> entity =
-                new HttpEntity<>(requestBody, buildHeaders());
+        HttpEntity<Map<String, Object>> entity = new HttpEntity<>(requestBody, buildHeaders());
 
         String url = baseUrl + "/chat/completions";
 
@@ -77,8 +77,7 @@ public class OllamaClient {
                     url,
                     HttpMethod.POST,
                     entity,
-                    Map.class
-            );
+                    Map.class);
 
             log.info("RAW RESPONSE: {}", response.getBody());
 
@@ -95,7 +94,7 @@ public class OllamaClient {
             // ── 429 Rate Limit: wait 15s and retry ONCE ──────────────
             if (e.getStatusCode().value() == 429) {
                 log.warn("OpenRouter rate limited (429) for model={}. " +
-                         "Waiting 15s before retry...", modelToUse);
+                        "Waiting 15s before retry...", modelToUse);
                 try {
                     Thread.sleep(15_000);
                 } catch (InterruptedException ie) {
@@ -106,11 +105,11 @@ public class OllamaClient {
                             url, HttpMethod.POST, entity, Map.class);
                     String retryContent = extractContent(retryResponse.getBody());
                     log.info("OpenRouter retry succeeded after 429 | model={} | " +
-                             "responseLength={}", modelToUse, retryContent.length());
+                            "responseLength={}", modelToUse, retryContent.length());
                     return retryContent;
                 } catch (Exception retryEx) {
                     log.error("OpenRouter retry also failed after 429: {}",
-                              retryEx.getMessage());
+                            retryEx.getMessage());
                     // Fall through to throw below
                 }
             }
@@ -165,6 +164,18 @@ public class OllamaClient {
                     "OpenRouter returned null response body",
                     FailureReason.SERVER_ERROR, 200);
         }
+        if (body.containsKey("error")) {
+            Map<String, Object> error = (Map<String, Object>) body.get("error");
+            String errorMsg = error != null ? (String) error.get("message") : "Provider error";
+            Integer errorCode = error != null && error.get("code") instanceof Integer
+                    ? (Integer) error.get("code")
+                    : 502;
+            log.error("OpenRouter provider error: code={}, message={}", errorCode, errorMsg);
+            throw new MoaeClientException(
+                    "OpenRouter provider error (code=" + errorCode + "): " + errorMsg,
+                    FailureReason.SERVER_ERROR,
+                    errorCode);
+        }
 
         Object choicesObj = body.get("choices");
         if (choicesObj == null) {
@@ -173,8 +184,7 @@ public class OllamaClient {
                     FailureReason.SERVER_ERROR, 200);
         }
 
-        List<Map<String, Object>> choices =
-                (List<Map<String, Object>>) choicesObj;
+        List<Map<String, Object>> choices = (List<Map<String, Object>>) choicesObj;
 
         if (choices.isEmpty()) {
             throw new MoaeClientException(
@@ -183,8 +193,7 @@ public class OllamaClient {
         }
 
         Map<String, Object> firstChoice = choices.get(0);
-        Map<String, Object> message =
-                (Map<String, Object>) firstChoice.get("message");
+        Map<String, Object> message = (Map<String, Object>) firstChoice.get("message");
 
         if (message == null) {
             throw new MoaeClientException(

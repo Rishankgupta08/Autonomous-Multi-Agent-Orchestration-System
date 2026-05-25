@@ -6,8 +6,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.moae.agent.dto.StepResult;
 import com.moae.agent.dto.VerificationResult;
 import com.moae.client.MoaeClientException;
-import com.moae.client.OllamaClient;
 import com.moae.enums.StepStatus;
+import com.moae.service.GroqLlmService;
 import com.moae.util.JsonExtractUtil;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -21,7 +21,7 @@ import java.util.Map;
 @Slf4j
 public class VerifierAgent {
 
-    private final OllamaClient ollamaClient;
+    private final GroqLlmService groqLlmService;
     private final ObjectMapper objectMapper;
 
     public VerificationResult verify(String goal, List<StepResult> stepResults) {
@@ -70,17 +70,24 @@ public class VerifierAgent {
                 Verdict rules:
                 - "SUCCESS" only if ALL steps succeeded
                 - "FAIL" if ANY step failed or the goal appears not achieved
+
+                IMPORTANT: All numeric fields MUST be plain integer literals (e.g. 90, 75, 100).
+                Do NOT write numbers as words (e.g. "ninety" is invalid — write 90).
+                Do NOT wrap the JSON in markdown or backticks.
+                Do NOT include <think> tags or any reasoning text.
+                Output ONLY the raw JSON object starting with { and ending with }.
                 """;
 
         String rawResponse = null;
 
         try {
-            // ── STEP D: Call OpenRouter ───────────────────────────────
-            rawResponse = ollamaClient.generate(verifierPrompt);
+            // ── STEP D: Call Groq ─────────────────────────────────────
+            rawResponse = groqLlmService.verifierCall(verifierPrompt);
             log.debug("VerifierAgent raw response: {}", rawResponse);
 
-            // ── STEP E: Extract and parse JSON object ─────────────────
+            // ── STEP E: Extract and sanitize JSON object ──────────────
             String jsonObj = JsonExtractUtil.extractJsonObject(rawResponse);
+            jsonObj = sanitizeJsonNumbers(jsonObj);
             Map<String, Object> parsed = objectMapper.readValue(
                     jsonObj, new TypeReference<Map<String, Object>>() {});
 
@@ -109,13 +116,13 @@ public class VerifierAgent {
                     .build();
 
         } catch (MoaeClientException e) {
-            log.error("VerifierAgent: OpenRouter unavailable ({}). " +
+            log.error("VerifierAgent: Groq unavailable ({}). " +
                       "Using programmatic fallback scoring.", e.getMessage());
             return buildFallbackResult(stepResults,
-                    "OpenRouter unavailable: " + e.getMessage());
+                    "Groq unavailable: " + e.getMessage());
 
         } catch (JsonProcessingException e) {
-            log.warn("VerifierAgent: Failed to parse OpenRouter JSON response. " +
+            log.warn("VerifierAgent: Failed to parse Groq JSON response. " +
                      "Using programmatic fallback. Raw response: {}", rawResponse);
             return buildFallbackResult(stepResults, "AI response parsing failed.");
 
@@ -124,6 +131,39 @@ public class VerifierAgent {
             return buildFallbackResult(stepResults,
                     "Unexpected error: " + e.getMessage());
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // SANITIZER: rewrite bare-word number literals before JSON parsing.
+    // Some LLMs write "decisionAccuracy": ninety instead of 90.
+    // This regex replaces known English word-numbers with their integer
+    // equivalents so Jackson can parse the JSON without blowing up.
+    // ─────────────────────────────────────────────────────────────────
+    private static final Map<String, String> WORD_NUMBERS = Map.ofEntries(
+            Map.entry("zero",         "0"),
+            Map.entry("ten",         "10"),
+            Map.entry("twenty",      "20"),
+            Map.entry("thirty",      "30"),
+            Map.entry("forty",       "40"),
+            Map.entry("fifty",       "50"),
+            Map.entry("sixty",       "60"),
+            Map.entry("seventy",     "70"),
+            Map.entry("eighty",      "80"),
+            Map.entry("ninety",      "90"),
+            Map.entry("hundred",    "100"),
+            Map.entry("one hundred","100")
+    );
+
+    private String sanitizeJsonNumbers(String json) {
+        String result = json;
+        for (Map.Entry<String, String> entry : WORD_NUMBERS.entrySet()) {
+            // Match the bare word after a colon+whitespace, surrounded by optional whitespace
+            // e.g. "decisionAccuracy": ninety,
+            result = result.replaceAll(
+                    "(?i)(:\\s*)" + entry.getKey() + "(\\s*[,}])",
+                    "$1" + entry.getValue() + "$2");
+        }
+        return result;
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -178,9 +218,24 @@ public class VerifierAgent {
                 .build();
     }
 
+    /**
+     * Safely converts a Jackson-parsed JSON value to int.
+     *
+     * Jackson deserialises JSON numbers without a declared type as Double by
+     * default, so we must handle Double explicitly. We also cover Integer,
+     * Long, Number (generic), and String (for quote-wrapped numbers like "90").
+     */
     private int toInt(Object val, int defaultVal) {
-        if (val instanceof Integer) return (Integer) val;
-        if (val instanceof String)  return Integer.parseInt((String) val);
+        if (val == null)           return defaultVal;
+        if (val instanceof Integer i) return i;
+        if (val instanceof Long l)    return l.intValue();
+        if (val instanceof Double d)  return d.intValue();
+        if (val instanceof Number n)  return n.intValue();
+        if (val instanceof String s) {
+            try { return Integer.parseInt(s.trim()); }
+            catch (NumberFormatException e) { return defaultVal; }
+        }
         return defaultVal;
     }
 }
+

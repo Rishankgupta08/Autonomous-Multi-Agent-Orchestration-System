@@ -7,7 +7,6 @@ import com.moae.client.GitHubClient;
 import com.moae.client.JiraClient;
 import com.moae.client.MoaeClientException;
 import com.moae.client.SlackClient;
-import com.moae.client.OllamaClient;
 import com.moae.client.dto.GitHubFileResponse;
 import com.moae.agent.dto.StepResult;
 import com.moae.entity.User;
@@ -19,6 +18,7 @@ import com.moae.repository.UserIntegrationRepository;
 import com.moae.repository.UserRepository;
 import com.moae.repository.WorkflowStepRepository;
 import com.moae.repository.WorkflowRunRepository;
+import com.moae.service.GroqLlmService;
 import com.moae.sse.SseEmitterRegistry;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -43,6 +43,8 @@ import java.util.UUID;
  * - Credentials loaded ONCE before the loop — not queried inside each step.
  * - generatedCode tracked across steps — LLM output flows into pushFile
  * content.
+ * - fetchedFileContent/fetchedFilePath tracked — feed real file context into
+ * generateCode prompt.
  * - Every step emits substep_complete SSE regardless of success or failure.
  * - MoaeClientException is caught first (typed failure info); then generic
  * Exception.
@@ -59,7 +61,7 @@ public class ExecutorAgent {
     private final GitHubClient gitHubClient;
     private final JiraClient jiraClient;
     private final SlackClient slackClient;
-    private final OllamaClient ollamaClient;
+    private final GroqLlmService groqLlmService;
     private final UserRepository userRepository;
     private final UserIntegrationRepository userIntegrationRepository;
     private final WorkflowStepRepository workflowStepRepository;
@@ -103,7 +105,10 @@ public class ExecutorAgent {
                 .map(i -> parseConfigJson(i.getConfigJson()))
                 .orElse(null);
 
-        String generatedCode = null; // carries LLM output from generateCode → pushFile
+        String generatedCode = null;        // carries LLM output from generateCode → pushFile
+        String fetchedFileContent = null;   // carries file content from getFile → generateCode
+        String fetchedFilePath = null;      // carries file path from getFile → generateCode
+
         List<StepResult> results = new ArrayList<>();
 
         // ── STEP B: Execution loop ────────────────────────────────────────────
@@ -128,11 +133,22 @@ public class ExecutorAgent {
             // ── TRY: execute the step ─────────────────────────────────────────
             try {
                 String resultJson = routeStep(tool, action, params,
-                        githubToken, githubOwner, jiraConfig, slackConfig, generatedCode);
+                        githubToken, githubOwner, jiraConfig, slackConfig,
+                        generatedCode, fetchedFileContent, fetchedFilePath);
+
+                // Track fetched file content for subsequent generateCode steps
+                if ("getFile".equals(action) && resultJson != null) {
+                    Map<String, Object> fileResult = objectMapper.readValue(
+                            resultJson, new TypeReference<>() {});
+                    fetchedFileContent = (String) fileResult.get("content");
+                    fetchedFilePath = (String) fileResult.get("filePath");
+                    log.info("Stored fetched file | path={} | contentLength={}",
+                            fetchedFilePath,
+                            fetchedFileContent != null ? fetchedFileContent.length() : 0);
+                }
 
                 // Carry generated code forward to any subsequent pushFile step
                 if ("generateCode".equals(action) && resultJson != null) {
-                    // Extract the actual code string from the JSON result
                     generatedCode = resultJson;
                 }
 
@@ -240,16 +256,18 @@ public class ExecutorAgent {
      * Returns a JSON string result in all cases (success) or throws
      * MoaeClientException (failure).
      *
-     * @param generatedCode LLM-generated code from a prior "generateCode" step; may
-     *                      be null
+     * @param generatedCode      LLM-generated code from a prior "generateCode" step; may be null
+     * @param fetchedFileContent raw file content fetched from a prior "getFile" step; may be null
+     * @param fetchedFilePath    path of the file fetched in the prior "getFile" step; may be null
      * @return JSON string of the step result
      */
     private String routeStep(String tool, String action, Map<String, Object> params,
             String githubToken, String githubOwner,
             Map<String, Object> jiraConfig, Map<String, Object> slackConfig,
-            String generatedCode) throws JsonProcessingException {
+            String generatedCode,
+            String fetchedFileContent, String fetchedFilePath) throws JsonProcessingException {
 
-        // Inline param extractor helpers
+        // Inline param extractor helper
         java.util.function.BiFunction<String, String, String> p = (key, fallback) -> params != null
                 ? (String) params.getOrDefault(key, fallback)
                 : fallback;
@@ -270,7 +288,7 @@ public class ExecutorAgent {
                                 "filePath", filePath));
                     }
                     case "createBranch" -> {
-                        String owner = p.apply("owner", githubOwner); // ← add this
+                        String owner = p.apply("owner", githubOwner);
                         String repo = p.apply("repo", "");
                         String newBranchName = p.apply("newBranchName", "");
                         String baseBranch = p.apply("baseBranch", "main");
@@ -364,8 +382,14 @@ public class ExecutorAgent {
                         String projectKey = p.apply("projectKey", "");
                         String summary = p.apply("summary", "");
                         String description = p.apply("description", "Created by MOAE automation");
+                        // "assigneeEmail" is the current key; fall back to legacy "assigneeName"
+                        // so that plans persisted before this rename still resolve correctly.
+                        String assigneeEmail = p.apply("assigneeEmail", "");
+                        if (assigneeEmail.isBlank()) {
+                            assigneeEmail = p.apply("assigneeName", "");
+                        }
                         String issueKey = jiraClient.createTicket(
-                                domain, email, apiToken, projectKey, summary, description);
+                                domain, email, apiToken, projectKey, summary, description, assigneeEmail);
                         return objectMapper.writeValueAsString(Map.of("issueKey", issueKey));
                     }
                     case "updateStatus" -> {
@@ -409,11 +433,61 @@ public class ExecutorAgent {
                 switch (action) {
                     case "generateCode" -> {
                         String instruction = p.apply("instruction", "");
-                        String codePrompt = "You are an expert Java developer. " +
-                                "Return ONLY the modified code. No explanation. No backticks. No markdown.\n" +
-                                "Instruction: " + instruction;
-                        String generatedResult = ollamaClient.generate(codePrompt);
-                        return objectMapper.writeValueAsString(Map.of("generatedCode", generatedResult));
+                        String filePath = fetchedFilePath != null ? fetchedFilePath : "unknown file";
+                        String existingContent = fetchedFileContent != null
+                                ? fetchedFileContent
+                                : "(file is new — write from scratch)";
+
+                        String codePrompt = """
+                                You are a precise code generator.
+                                Return ONLY the complete updated file content.
+
+                                RULES — follow these exactly:
+                                1. Return raw code only. No markdown. No backticks. No explanation.
+                                2. Never write placeholder text like <generated code>, TODO,
+                                   PASTE_HERE, or any angle-bracket placeholders.
+                                3. Keep ALL existing code unless the instruction says to remove it.
+                                4. If adding a function, preserve all existing functions.
+                                5. The output must be valid, complete, runnable code.
+
+                                File: """ + filePath + """
+
+                                Existing content:
+                                """ + existingContent + """
+
+                                Instruction: """ + instruction + """
+
+                                Write the complete updated file now:""";
+
+                        String generatedResult = groqLlmService.codeGeneratorCall(codePrompt);
+
+                        // Validate — reject placeholder responses
+                        List<String> PLACEHOLDERS = List.of(
+                                "<generated", "PASTE_", "TODO",
+                                "// your code here", "# your code here",
+                                "previous step", "generated code"
+                        );
+                        boolean isPlaceholder = PLACEHOLDERS.stream()
+                                .anyMatch(p2 -> generatedResult.toLowerCase().contains(p2.toLowerCase()));
+
+                        if (isPlaceholder) {
+                            log.warn("generateCode: Groq returned placeholder text — retrying once");
+                            String retry = groqLlmService.codeGeneratorCall(
+                                    "IMPORTANT: Return ONLY real code. No placeholders. No angle brackets.\n\n"
+                                            + codePrompt);
+                            boolean retryIsPlaceholder = PLACEHOLDERS.stream()
+                                    .anyMatch(p2 -> retry.toLowerCase().contains(p2.toLowerCase()));
+                            if (retryIsPlaceholder) {
+                                throw new MoaeClientException(
+                                        "Code generation produced invalid placeholder output after retry",
+                                        FailureReason.SERVER_ERROR, 0);
+                            }
+                            return objectMapper.writeValueAsString(
+                                    Map.of("generatedCode", retry));
+                        }
+
+                        return objectMapper.writeValueAsString(
+                                Map.of("generatedCode", generatedResult));
                     }
                     default -> throw new MoaeClientException(
                             "Unknown LLM action: " + action, FailureReason.CLIENT_ERROR, 0);

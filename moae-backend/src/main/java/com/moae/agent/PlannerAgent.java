@@ -3,7 +3,8 @@ package com.moae.agent;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.moae.client.OllamaClient;
+import com.moae.client.MoaeClientException;
+import com.moae.service.GroqLlmService;
 import com.moae.util.JsonExtractUtil;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -17,7 +18,7 @@ import java.util.Map;
 @Slf4j
 public class PlannerAgent {
 
-    private final OllamaClient ollamaClient;
+    private final GroqLlmService groqLlmService;
     private final ObjectMapper objectMapper;
 
     // Hardcoded safety defaults
@@ -55,8 +56,14 @@ public class PlannerAgent {
                 Return ONLY valid JSON.
                 """;
 
-        String rawIntent = ollamaClient.generate(extractionPrompt);
-        log.info("EXTRACTED INTENT RAW: {}", rawIntent);
+        String rawIntent;
+        try {
+            rawIntent = groqLlmService.plannerCall(extractionPrompt);
+        } catch (Exception e) {
+            log.warn("PlannerAgent: Intent extraction LLM call failed ({}). " +
+                    "Falling back to standard planning.", e.getMessage());
+            return plan(userMessage);
+        }
 
         Map<String, Object> intent;
         try {
@@ -182,10 +189,20 @@ public class PlannerAgent {
                         - pushFile:      owner, repo, filePath, content, commitMessage, branchName
                         - createPR:      owner, repo, title, head, base
                         - triggerAction: owner, repo, workflowId, ref
-                        - createTicket:  projectKey, summary, description
+                        - createTicket:  projectKey, summary, description, assigneeEmail
                         - updateStatus:  issueId, transitionName
                         - sendMessage:   channel, text
                         - generateCode:  instruction
+
+                        10. If the goal mentions an email address AND the intent is to assign
+                            someone to the ticket, include that email as assigneeEmail param
+                            in the createTicket step. If no email is mentioned or assignment
+                            is not requested, omit assigneeEmail entirely from params.
+                            Never add a separate updateStatus step after createTicket.
+                            Do NOT add updateStatus when the intent is to create a new ticket.
+
+                        If any rules conflict with each other or with the user message,
+                        these rules take strict precedence. Do not add conflicting steps.
 
                         Use "In Progress" when starting work on the ticket.
                         Use "Done" when the PR has been created and work is complete.
@@ -193,20 +210,76 @@ public class PlannerAgent {
                         - "To Do"
                         - "In Progress"
                         - "Done"
+
+                        ## TOKEN BUDGET WARNING
+                        The <think> block costs tokens. You have a LIMITED output budget.
+                        DO NOT think for more than 5 lines internally.
+                        Start printing [ IMMEDIATELY after reading the goal.
+                        The JSON array must be COMPLETE. Every { must have a }.
+                        The array must end with ] as the VERY LAST CHARACTER.
+                        An incomplete array is worse than an empty array.
+                        If you are running out of space, close all open brackets and end with ]
+
+                        IMPORTANT: Output ONLY a valid JSON array. No explanation, no preamble,
+                        no <think> tags, no markdown, no backticks.
+                        Start your response with [ and end with ].
+                        If rules conflict, apply the rules strictly and omit the conflicting step.
                         """,
                 userMessage, ticket.summary(), ticket.description(), ticket.issueKey(),
                 owner, repo, slackChannel, ticket.issueKey());
 
-        return executePlanGeneration(prompt, "Ticket: " + ticket.issueKey());
+        // planFromTicketWithIntent always has GitHub context injected by the caller
+        return executePlanGeneration(prompt, "Ticket: " + ticket.issueKey(), true, true, true);
     }
 
     public List<Map<String, Object>> plan(String goal) {
         log.info("PLANNER STARTED | goal={}", goal);
 
-        // ── Build prompt — NO hardcoded project keys or channels ──────
+        // ── Detect intent scope from goal text ───────────────────────
+        String goalLower = goal.toLowerCase();
+        boolean mentionsGitHub = goalLower.contains("github") || goalLower.contains("repo")
+                || goalLower.contains("branch") || goalLower.contains("pull request")
+                || goalLower.contains(" pr ") || goalLower.contains("push")
+                || goalLower.contains("commit") || goalLower.contains("merge")
+                || goalLower.contains("code") || goalLower.contains("file");
+        boolean mentionsJira = goalLower.contains("jira") || goalLower.contains("ticket")
+                || goalLower.contains("issue") || goalLower.contains("task")
+                || goalLower.contains("story") || goalLower.contains("epic")
+                || goalLower.contains("sprint");
+        boolean mentionsCode = goalLower.contains("generate") || goalLower.contains("write code")
+                || goalLower.contains("implement") || goalLower.contains("scaffold")
+                || goalLower.contains("create code");
+
+        // Build a scope-exclusion section so the LLM knows which tools are off-limits
+        String scopeRules;
+        if (mentionsJira && !mentionsGitHub && !mentionsCode) {
+            // Pure Jira/Slack goal — absolutely no GitHub steps
+            scopeRules = """
+
+                SCOPE CONSTRAINT — READ BEFORE GENERATING:
+                The goal is ONLY about Jira (and optionally Slack).
+                Do NOT include ANY github steps (createBranch, pushFile, createPR, getFile, triggerAction).
+                Do NOT include ANY llm steps (generateCode).
+                Violating this rule produces a wrong plan — omit those steps entirely.
+                """;
+        } else if (mentionsGitHub && !mentionsJira) {
+            // Pure GitHub goal
+            scopeRules = """
+
+                SCOPE CONSTRAINT — READ BEFORE GENERATING:
+                The goal is ONLY about GitHub operations.
+                Only include jira or slack steps if the goal explicitly mentions them.
+                """;
+        } else {
+            // Mixed or ambiguous — no extra constraint, rely on rule 5
+            scopeRules = "";
+        }
+
+        // ── Build prompt ─────────────────────────────────────────────
         String prompt = """
                 You are a workflow planner for MOAE, a developer automation system.
-                Your job is to decompose a developer goal into a sequence of executable steps.
+                Your job is to decompose a developer goal into a MINIMAL sequence of
+                executable steps. Only include steps that are explicitly required.
 
                 Available tools and their actions:
                 - tool: "github" → actions: getFile, createBranch, pushFile, createPR, triggerAction
@@ -219,7 +292,8 @@ public class PlannerAgent {
                 2. Each step must have exactly three fields: "tool", "action", "params"
                 3. "params" must be a JSON object with the relevant parameters for that action
                 4. Logical order matters: fetch before modify, create branch before push, push before PR
-                5. Only include steps that are necessary for the goal
+                5. Only include steps that are EXPLICITLY necessary for the goal.
+                   Do NOT add steps the goal does not ask for.
                 6. Read the goal carefully — use any project keys, channel names, repo names,
                    or branch names mentioned explicitly in the goal text
                 7. If the goal does not mention a specific value, use a sensible short placeholder
@@ -231,13 +305,23 @@ public class PlannerAgent {
                 - pushFile:      owner, repo, filePath, content, commitMessage, branchName
                 - createPR:      owner, repo, title, head, base
                 - triggerAction: owner, repo, workflowId, ref
-                - createTicket:  projectKey, summary, description
+                - createTicket:  projectKey, summary, description, assigneeEmail
                 - updateStatus:  issueId, transitionName
                 - sendMessage:   channel, text
                 - generateCode:  instruction
 
+                8. If the goal mentions an email address AND the intent is to assign
+                   someone to the ticket, include that email as assigneeEmail param
+                   in the createTicket step. If no email is mentioned or assignment
+                   is not requested, omit assigneeEmail entirely from params.
+                   Never add a separate updateStatus step after createTicket.
+                   Do NOT add updateStatus when the intent is to create a new ticket.
+
+                If any rules conflict with each other or with the goal text,
+                these rules take strict precedence. Do not add conflicting steps.
+
                 Goal:
-                """ + goal + """
+                """ + goal + scopeRules + """
 
                 Use "In Progress" when starting work on the ticket.
                 Use "Done" when the PR has been created and work is complete.
@@ -246,9 +330,23 @@ public class PlannerAgent {
                 - "To Do"
                 - "In Progress"
                 - "Done"
+
+                ## TOKEN BUDGET WARNING
+                The <think> block costs tokens. You have a LIMITED output budget.
+                DO NOT think for more than 5 lines internally.
+                Start printing [ IMMEDIATELY after reading the goal.
+                The JSON array must be COMPLETE. Every { must have a }.
+                The array must end with ] as the VERY LAST CHARACTER.
+                An incomplete array is worse than an empty array.
+                If you are running out of space, close all open brackets and end with ]
+
+                IMPORTANT: Output ONLY a valid JSON array. No explanation, no preamble,
+                no <think> tags, no markdown, no backticks.
+                Start your response with [ and end with ].
+                If rules conflict, apply the rules strictly and omit the conflicting step.
                 """;
 
-        return executePlanGeneration(prompt, goal);
+        return executePlanGeneration(prompt, goal, mentionsGitHub, mentionsJira, mentionsCode);
     }
 
     public List<Map<String, Object>> planFromTicket(com.moae.client.dto.JiraTicketResponse ticket) {
@@ -284,10 +382,20 @@ public class PlannerAgent {
                 - pushFile:      owner, repo, filePath, content, commitMessage, branchName
                 - createPR:      owner, repo, title, head, base
                 - triggerAction: owner, repo, workflowId, ref
-                - createTicket:  projectKey, summary, description
+                - createTicket:  projectKey, summary, description, assigneeEmail
                 - updateStatus:  issueId, transitionName
                 - sendMessage:   channel, text
                 - generateCode:  instruction
+
+                9. If the ticket description or user request mentions an email address AND
+                   the intent is to assign someone, include that email as assigneeEmail param
+                   in the createTicket step. If no email is mentioned or assignment
+                   is not requested, omit assigneeEmail entirely from params.
+                   Do NOT add updateStatus when the intent is to create a new ticket.
+
+                If any rules conflict with each other or with the ticket content,
+                these rules take strict precedence. Do not add conflicting steps.
+
                 Use "In Progress" when starting work on the ticket.
                 Use "Done" when the PR has been created and work is complete.
 
@@ -295,15 +403,45 @@ public class PlannerAgent {
                 - "To Do"
                 - "In Progress"
                 - "Done"
+
+                ## TOKEN BUDGET WARNING
+                The <think> block costs tokens. You have a LIMITED output budget.
+                DO NOT think for more than 5 lines internally.
+                Start printing [ IMMEDIATELY after reading the goal.
+                The JSON array must be COMPLETE. Every { must have a }.
+                The array must end with ] as the VERY LAST CHARACTER.
+                An incomplete array is worse than an empty array.
+                If you are running out of space, close all open brackets and end with ]
+
+                IMPORTANT: Output ONLY a valid JSON array. No explanation, no preamble,
+                no <think> tags, no markdown, no backticks.
+                Start your response with [ and end with ].
+                If rules conflict, apply the rules strictly and omit the conflicting step.
                 """, ticket.summary(), ticket.description(), ticket.issueKey(), ticket.issueKey());
 
-        return executePlanGeneration(prompt, "Ticket: " + ticket.issueKey());
+        // planFromTicket is always ticket-aware — GitHub steps are intentional here
+        return executePlanGeneration(prompt, "Ticket: " + ticket.issueKey(), true, true, true);
     }
 
-    private List<Map<String, Object>> executePlanGeneration(String prompt, String goalContext) {
-        // ── Call OpenRouter ───────────────────────────────────────────
-        String rawResponse = ollamaClient.generate(prompt);
-        log.debug("PlannerAgent raw OpenRouter response: {}", rawResponse);
+    /**
+     * Executes plan generation and applies a deterministic intent filter on the
+     * parsed plan to remove any steps whose tool is incompatible with what the
+     * goal actually asked for.
+     *
+     * <p>This is the reliable safety net layer. Even if the LLM ignores the scope
+     * constraint in its prompt, this filter will strip the hallucinated steps in
+     * Java before they ever reach the ExecutorAgent.
+     *
+     * <p>The caller computes the three boolean flags from the goal text using the
+     * same keyword logic as the prompt scope-exclusion block, ensuring both layers
+     * are always in agreement.
+     */
+    private List<Map<String, Object>> executePlanGeneration(
+            String prompt, String goalContext,
+            boolean mentionsGitHub, boolean mentionsJira, boolean mentionsCode) {
+        // ── Call Groq via plannerCall ─────────────────────────────────
+        String rawResponse = groqLlmService.plannerCall(prompt);
+        log.debug("PlannerAgent raw Groq response: {}", rawResponse);
 
         // ── Extract JSON array from response ──────────────────────────
         String jsonArray;
@@ -335,7 +473,7 @@ public class PlannerAgent {
                     "Failed to parse Planner JSON response: " + e.getMessage(), e);
         }
 
-        // ── Validate plan ─────────────────────────────────────────────
+        // ── Validate step structure ───────────────────────────────────
         if (plan == null || plan.isEmpty()) {
             throw new RuntimeException("Planner returned empty plan for goal: " + goalContext);
         }
@@ -353,16 +491,12 @@ public class PlannerAgent {
                     "updateStatus".equals(step.get("action"))) {
                 @SuppressWarnings("unchecked")
                 Map<String, Object> params = (Map<String, Object>) step.get("params");
-
                 Object transitionName = params.get("transitionName");
-
                 if (transitionName == null) {
                     throw new RuntimeException(
                             "Missing transitionName in jira:updateStatus step");
                 }
-
                 List<String> allowedTransitions = List.of("To Do", "In Progress", "Done");
-
                 if (!allowedTransitions.contains(transitionName.toString())) {
                     throw new RuntimeException(
                             "Invalid Jira transitionName at step " + i +
@@ -371,7 +505,30 @@ public class PlannerAgent {
             }
         }
 
-        log.info("PARSED STEPS SIZE: {}", plan.size());
-        return plan;
+        // ── Deterministic intent filter ───────────────────────────────
+        // If the goal is Jira-only (no GitHub/code mentions), strip any GitHub
+        // or llm steps the LLM hallucinated. This cannot be bypassed by the model.
+        List<Map<String, Object>> filtered = new java.util.ArrayList<>(plan);
+        if (mentionsJira && !mentionsGitHub && !mentionsCode) {
+            int before = filtered.size();
+            filtered.removeIf(step -> {
+                String tool = (String) step.get("tool");
+                return "github".equals(tool) || "llm".equals(tool);
+            });
+            int removed = before - filtered.size();
+            if (removed > 0) {
+                log.warn("IntentFilter: removed {} hallucinated GitHub/LLM step(s) " +
+                         "from a Jira-only goal. Before={} After={}",
+                         removed, before, filtered.size());
+            }
+        }
+
+        if (filtered.isEmpty()) {
+            throw new RuntimeException(
+                "Planner returned no valid steps after intent filtering for goal: " + goalContext);
+        }
+
+        log.info("PARSED STEPS SIZE: {} (after filter)", filtered.size());
+        return filtered;
     }
 }
