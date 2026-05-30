@@ -15,9 +15,12 @@ import org.springframework.web.client.ResourceAccessException;
 import org.springframework.web.client.RestTemplate;
 
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Base64;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.stream.Collectors;
 
 /**
  * HTTP adapter for the GitHub REST API v3.
@@ -353,4 +356,84 @@ public class GitHubClient {
             handleTimeout(e, "triggerAction");
         }
     }
+
+    // =========================================================================
+    // PUBLIC API — Repository tree
+    // =========================================================================
+
+    /**
+     * Fetches the recursive file tree of a repository branch using the Git Trees API.
+     *
+     * Files under common noise directories (node_modules, target, dist, etc.) are
+     * excluded. Result is capped at 150 entries so the SSE payload stays small.
+     *
+     * Non-critical: callers should catch Exception and continue on failure.
+     *
+     * @param owner       repository owner
+     * @param repo        repository name
+     * @param branch      branch whose tree to fetch (e.g. "main")
+     * @param accessToken GitHub OAuth token
+     * @return list of maps with keys: path, size, language
+     */
+    @SuppressWarnings("unchecked")
+    public List<Map<String, Object>> getFileTree(String owner, String repo,
+                                                  String branch, String accessToken) {
+        String url = GITHUB_API_BASE + "/repos/" + owner + "/" + repo
+                + "/git/trees/" + branch + "?recursive=1";
+        HttpEntity<Void> entity = new HttpEntity<>(buildGitHubHeaders(accessToken));
+
+        ResponseEntity<Map> response = restTemplate.exchange(
+                url, HttpMethod.GET, entity, Map.class);
+
+        List<Map<String, Object>> tree =
+                (List<Map<String, Object>>) response.getBody().get("tree");
+        if (tree == null) return new ArrayList<>();
+
+        List<String> EXCLUDE = List.of(
+                "node_modules/", ".git/", "dist/", "build/",
+                "target/", ".lock", ".class", ".jar"
+        );
+
+        List<Map<String, Object>> filtered = tree.stream()
+                .filter(item -> "blob".equals(item.get("type")))
+                .filter(item -> {
+                    String path = (String) item.get("path");
+                    return path != null && EXCLUDE.stream().noneMatch(path::contains);
+                })
+                .limit(150)
+                .map(item -> Map.<String, Object>of(
+                        "path",     item.get("path"),
+                        "size",     item.getOrDefault("size", 0),
+                        "language", detectLanguageFromPath((String) item.get("path"))
+                ))
+                .collect(Collectors.toList());
+
+        log.info("GitHub getFileTree: {}/{} branch='{}' → {} files",
+                owner, repo, branch, filtered.size());
+        return filtered;
+    }
+
+    /**
+     * Maps a file path extension to a syntax-highlighter language string.
+     * Mirrors the logic in ExecutorAgent / WorkflowService — kept here because
+     * GitHubClient is the one embedding language in the tree response.
+     */
+    private String detectLanguageFromPath(String path) {
+        if (path == null) return "plaintext";
+        if (path.endsWith(".py"))   return "python";
+        if (path.endsWith(".js"))   return "javascript";
+        if (path.endsWith(".ts"))   return "typescript";
+        if (path.endsWith(".jsx"))  return "javascript";
+        if (path.endsWith(".tsx"))  return "typescript";
+        if (path.endsWith(".java")) return "java";
+        if (path.endsWith(".html") || path.endsWith(".htm")) return "html";
+        if (path.endsWith(".css"))  return "css";
+        if (path.endsWith(".md"))   return "markdown";
+        if (path.endsWith(".json")) return "json";
+        if (path.endsWith(".xml"))  return "xml";
+        if (path.endsWith(".yml") || path.endsWith(".yaml")) return "yaml";
+        if (path.endsWith(".sh"))   return "shell";
+        return "plaintext";
+    }
 }
+

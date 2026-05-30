@@ -164,7 +164,7 @@ export default function WorkflowPage() {
               initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
               exit={{ opacity: 0 }}
-              className="max-w-[720px] mx-auto w-full"
+              className={codeReviewActive ? 'w-full' : 'max-w-[720px] mx-auto w-full'}
             >
               <AnimatePresence mode="wait">
                 {codeReviewActive && workflowId ? (
@@ -282,6 +282,7 @@ export default function WorkflowPage() {
               </AnimatePresence>
             </motion.div>
           )}
+
 
           {/* ── AWAITING MERGE PHASE (from Step 10 webhook) ────────── */}
           {phase === 'awaiting_merge' && (

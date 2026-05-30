@@ -67,10 +67,11 @@ public class PlannerAgent {
 
                 Return ONLY valid JSON — no explanation, no markdown, no backticks:
                 {
-                  "ticketId":      null or "EC-22",
+                  "ticketId": "Extract the Jira issue key. Rules: If user says 'EC-25' or 'PROJ-12' → return exactly that. If user says 'ticket 25' or '#25' or just '25' → return null (bare numbers without project key are ambiguous — do NOT guess). If user says 'work on 25' with no project prefix → return null. The jiraProjectKey default will be used to reconstruct it in Java.",
+                  "ticketNumber": "null or '25' ← just the number part if extracted",
                   "githubOwner":   "extracted or default owner",
                   "githubRepo":    "extracted or default repo",
-                  "slackChannel":  "extracted or default channel",
+                  "slackChannel":  "Extract the Slack channel. Rules: Always return with # prefix: '#dev-team', '#general', '#devops'. If user says 'dev team' or 'dev-team' → return '#dev-team'. If user says 'notify team' or 'notify the team' with NO specific channel → return null (do NOT invent a channel name — use the default). 'notify team' is NOT a channel name, it is intent. Only return a value if user explicitly names a channel.",
                   "jiraProjectKey": "extracted or default project key",
                   "isCreateIntent": true or false
                 }
@@ -111,6 +112,26 @@ public class PlannerAgent {
         //   2. User's saved default (UserDefaultsDTO field → not null)
         //   3. Hardcoded constant (last resort — avoids NullPointerException downstream)
         String ticketId = (String) intent.get("ticketId");
+        String extractedTicketNumber = (String) intent.get("ticketNumber");
+
+        // Reconstruct full ticket key if only number was extracted
+        if (ticketId == null && extractedTicketNumber != null) {
+            String projectKey = defaults.getJiraProjectKey();
+            if (projectKey != null && !projectKey.isBlank()) {
+                ticketId = projectKey.toUpperCase().trim() + "-" + extractedTicketNumber.trim();
+                log.info("PlannerAgent | reconstructed ticketId: {} from number: {} + projectKey: {}",
+                    ticketId, extractedTicketNumber, projectKey);
+            }
+        }
+
+        // Also handle the case where LLM returned just a number in ticketId field
+        if (ticketId != null && ticketId.matches("\\d+")) {
+            String projectKey = defaults.getJiraProjectKey();
+            if (projectKey != null && !projectKey.isBlank()) {
+                ticketId = projectKey.toUpperCase().trim() + "-" + ticketId.trim();
+                log.info("PlannerAgent | normalized bare number ticketId to: {}", ticketId);
+            }
+        }
 
         String githubOwner = (String) intent.get("githubOwner");
         if (defaults.getGithubOwner() != null && !defaults.getGithubOwner().isBlank()) {
@@ -126,8 +147,19 @@ public class PlannerAgent {
             githubRepo = DEFAULT_GITHUB_REPO;
 
         String slackChannel = (String) intent.get("slackChannel");
-        if (slackChannel == null && defaults.getSlackDefaultChannel() != null)
+        String goalLower = userMessage.toLowerCase();
+        
+        boolean channelLooksHallucinated = slackChannel != null 
+            && !goalLower.contains(slackChannel.replace("#", "").toLowerCase());
+
+        if ((slackChannel == null || channelLooksHallucinated) 
+            && defaults.getSlackDefaultChannel() != null) {
+            if (channelLooksHallucinated) {
+                log.warn("PlannerAgent | channel '{}' not found in goal text — overriding with default '{}'",
+                    slackChannel, defaults.getSlackDefaultChannel());
+            }
             slackChannel = defaults.getSlackDefaultChannel();
+        }
         if (slackChannel == null)
             slackChannel = DEFAULT_SLACK_CHANNEL;
 
@@ -138,7 +170,7 @@ public class PlannerAgent {
             jiraProjectKey = defaults.getJiraProjectKey();
 
         // Detect CREATE intent — don't fetch a ticket that doesn't exist yet
-        String goalLower = userMessage.toLowerCase();
+        // goalLower is already defined above
         boolean isCreateIntent = goalLower.contains("create")
                 || goalLower.contains("new ticket")
                 || goalLower.contains("open ticket")
@@ -266,6 +298,14 @@ public class PlannerAgent {
                             If the ticket is ALREADY 'In Progress', SKIP the first updateStatus step entirely.
                             Only add updateStatus steps when the status actually needs to change.
 
+                        12. RULE: For slack:sendMessage steps, the channel param MUST be an actual 
+                            Slack channel name (starting with #) that was either explicitly mentioned 
+                            in the user's goal OR taken from the user defaults. The phrases 'notify team', 
+                            'notify the team', 'inform team', 'let the team know' are INTENT phrases — 
+                            they describe what to do, not which channel. If the user writes these phrases 
+                            without naming a channel, use the default channel from context. 
+                            NEVER invent channel names from intent phrases.
+
                         If any rules conflict with each other or with the user message,
                         these rules take strict precedence. Do not add conflicting steps.
 
@@ -387,6 +427,14 @@ public class PlannerAgent {
                    Never add a separate updateStatus step after createTicket.
                    Do NOT add updateStatus when the intent is to create a new ticket.
 
+                9. RULE: For slack:sendMessage steps, the channel param MUST be an actual 
+                   Slack channel name (starting with #) that was either explicitly mentioned 
+                   in the user's goal OR taken from the user defaults. The phrases 'notify team', 
+                   'notify the team', 'inform team', 'let the team know' are INTENT phrases — 
+                   they describe what to do, not which channel. If the user writes these phrases 
+                   without naming a channel, use the default channel from context. 
+                   NEVER invent channel names from intent phrases.
+
                 If any rules conflict with each other or with the goal text,
                 these rules take strict precedence. Do not add conflicting steps.
 
@@ -473,6 +521,14 @@ public class PlannerAgent {
                     check the ticket's current status (available in the ticket context). 
                     If the ticket is ALREADY 'In Progress', SKIP the first updateStatus step entirely.
                     Only add updateStatus steps when the status actually needs to change.
+
+                11. RULE: For slack:sendMessage steps, the channel param MUST be an actual 
+                    Slack channel name (starting with #) that was either explicitly mentioned 
+                    in the user's goal OR taken from the user defaults. The phrases 'notify team', 
+                    'notify the team', 'inform team', 'let the team know' are INTENT phrases — 
+                    they describe what to do, not which channel. If the user writes these phrases 
+                    without naming a channel, use the default channel from context. 
+                    NEVER invent channel names from intent phrases.
 
                 If any rules conflict with each other or with the ticket content,
                 these rules take strict precedence. Do not add conflicting steps.

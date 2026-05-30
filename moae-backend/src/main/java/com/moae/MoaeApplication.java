@@ -3,6 +3,7 @@ package com.moae;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.scheduling.annotation.EnableAsync;
+import org.springframework.scheduling.annotation.EnableScheduling;
 
 /**
  * MOAE — Autonomous Multi-Agent Orchestration Engine
@@ -26,6 +27,7 @@ import org.springframework.scheduling.annotation.EnableAsync;
  */
 @SpringBootApplication
 @EnableAsync
+@EnableScheduling
 public class MoaeApplication {
 
     public static void main(String[] args) {

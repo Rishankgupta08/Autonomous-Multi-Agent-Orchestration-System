@@ -33,6 +33,7 @@ import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
@@ -77,6 +78,7 @@ public class WorkflowController {
     private final UserRepository         userRepository;
     private final MergeConfirmService    mergeConfirmService;
     private final WorkflowService        workflowService;
+    private final com.moae.client.GitHubClient gitHubClient;
 
     // ─────────────────────────────────────────────────────────────────────────
     // STEP 4: POST /api/workflow/execute
@@ -161,16 +163,18 @@ public class WorkflowController {
             return dead;
         }
 
-        SseEmitter emitter = new SseEmitter(300_000L); // 5-minute timeout
+        SseEmitter emitter = new SseEmitter(30 * 60 * 1000L); // 30-minute timeout
 
         emitter.onTimeout(() -> {
             log.debug("SSE timeout for workflowId={}", workflowId);
-            sseEmitterRegistry.remove(id);
+            sseEmitterRegistry.remove(UUID.fromString(workflowId));
         });
-
+        emitter.onCompletion(() -> {
+            sseEmitterRegistry.remove(UUID.fromString(workflowId));
+        });
         emitter.onError(e -> {
             log.debug("SSE error for workflowId={}: {}", workflowId, e.getMessage());
-            sseEmitterRegistry.remove(id);
+            sseEmitterRegistry.remove(UUID.fromString(workflowId));
         });
 
         sseEmitterRegistry.register(id, emitter);
@@ -435,5 +439,91 @@ public class WorkflowController {
         }
         workflowService.approveCode(wfId, userId, request);
         return ResponseEntity.accepted().body(Map.of("message", "Code approved. Resuming workflow..."));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // CODE REVIEW — GET /{workflowId}/repo-file
+    // Fetches the current content of any file in the repo so the user can
+    // open and edit additional files in the IDE panel during code review.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Returns the decoded content of a single file from the GitHub repository
+     * linked to the paused workflow.
+     *
+     * Security:
+     *   - Session required (getUserId throws 401 if no session).
+     *   - Ownership checked via run.getUserId().equals(userId) — 403 if mismatch.
+     *   - Only available while workflow is AWAITING_CODE_REVIEW — 409 otherwise.
+     *
+     * @param workflowId UUID string of the paused WorkflowRun
+     * @param filePath   repo-relative path of the file to fetch (e.g. "src/utils.py")
+     * @param session    current HttpSession
+     * @return 200 { content, language, filePath } | 403 | 404 | 409
+     */
+    @GetMapping("/{workflowId}/repo-file")
+    public ResponseEntity<Map<String, String>> getRepoFile(
+            @PathVariable UUID workflowId,
+            @RequestParam String filePath,
+            HttpSession session) {
+
+        UUID userId = SessionUtil.getUserId(session);
+
+        WorkflowRun run = workflowRunRepository.findById(workflowId).orElse(null);
+        if (run == null) {
+            return ResponseEntity.notFound().build();
+        }
+        if (!run.getUser().getId().equals(userId)) {
+            return ResponseEntity.status(403).build();
+        }
+        if (run.getStatus() != com.moae.enums.WorkflowStatus.AWAITING_CODE_REVIEW) {
+            return ResponseEntity.status(409)
+                    .body(Map.of("error", "Workflow is not awaiting code review"));
+        }
+
+        String token = userRepository.findById(userId)
+                .orElseThrow()
+                .getGithubAccessToken();
+
+        String owner  = run.getPendingOwner() != null ? run.getPendingOwner() : "";
+        String repo   = run.getPendingRepo()  != null ? run.getPendingRepo()  : "";
+
+        try {
+            com.moae.client.dto.GitHubFileResponse file =
+                    gitHubClient.getFile(owner, repo, filePath, token);
+
+            return ResponseEntity.ok(Map.of(
+                    "content",  file.content(),
+                    "language", detectLanguageFromPath(filePath),
+                    "filePath", filePath
+            ));
+        } catch (Exception e) {
+            log.warn("getRepoFile | not found: {}/{}/{} — {}", owner, repo, filePath, e.getMessage());
+            return ResponseEntity.status(404)
+                    .body(Map.of("error", "File not found: " + filePath));
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // PRIVATE HELPERS
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /** Maps a file-path extension to a Monaco editor language identifier. */
+    private static String detectLanguageFromPath(String path) {
+        if (path == null) return "plaintext";
+        if (path.endsWith(".py"))   return "python";
+        if (path.endsWith(".js"))   return "javascript";
+        if (path.endsWith(".ts"))   return "typescript";
+        if (path.endsWith(".jsx"))  return "javascript";
+        if (path.endsWith(".tsx"))  return "typescript";
+        if (path.endsWith(".java")) return "java";
+        if (path.endsWith(".html") || path.endsWith(".htm")) return "html";
+        if (path.endsWith(".css"))  return "css";
+        if (path.endsWith(".md"))   return "markdown";
+        if (path.endsWith(".json")) return "json";
+        if (path.endsWith(".xml"))  return "xml";
+        if (path.endsWith(".yml") || path.endsWith(".yaml")) return "yaml";
+        if (path.endsWith(".sh"))   return "shell";
+        return "plaintext";
     }
 }

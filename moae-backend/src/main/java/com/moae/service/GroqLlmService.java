@@ -43,17 +43,22 @@ public class GroqLlmService {
 
     /** Used by PlannerAgent for plan generation and intent extraction. */
     public String plannerCall(String prompt) {
-        return callGroq("qwen/qwen3-32b", prompt);
+        return callGroq("qwen/qwen3-32b", prompt, 0.2, 3000);
     }
 
     /** Used by ExecutorAgent for the generateCode step. */
     public String codeGeneratorCall(String prompt) {
-        return callGroq("llama-3.3-70b-versatile", prompt);
+        return callGroq("llama-3.3-70b-versatile", prompt, 0.2, 3000);
     }
 
     /** Used by VerifierAgent for plan and result verification. */
     public String verifierCall(String prompt) {
-        return callGroq("openai/gpt-oss-120b", prompt);
+        return callGroq("openai/gpt-oss-120b", prompt, 0.2, 3000);
+    }
+
+    /** Used by IdeAgent for iterative code review modifications. */
+    public String ideAgentCall(String prompt) {
+        return callGroq("deepseek-r1-distill-llama-70b", prompt, 0.1, 4000);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -61,19 +66,23 @@ public class GroqLlmService {
     // ─────────────────────────────────────────────────────────────────────────
 
     @SuppressWarnings("unchecked")
-    private String callGroq(String model, String prompt) {
+    private String callGroq(String model, String prompt, double temperature, int maxTokens) {
         String promptPreview = prompt.length() > 100
                 ? prompt.substring(0, 100) + "..."
                 : prompt;
-        log.info("GroqLlmService calling model={} | prompt[:100]={}", model, promptPreview);
+        if (model.equals("deepseek-r1-distill-llama-70b")) {
+            log.info("GroqLlmService [IdeAgent] calling model={} | prompt[:100]={}", model, promptPreview);
+        } else {
+            log.info("GroqLlmService calling model={} | prompt[:100]={}", model, promptPreview);
+        }
 
         // Build request body (OpenAI Chat Completions format)
         Map<String, Object> message = Map.of("role", "user", "content", prompt);
         Map<String, Object> requestBody = Map.of(
                 "model", model,
                 "messages", List.of(message),
-                "temperature", 0.2,
-                "max_tokens", 3000);
+                "temperature", temperature,
+                "max_tokens", maxTokens);
 
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_JSON);

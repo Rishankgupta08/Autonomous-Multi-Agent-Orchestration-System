@@ -24,4 +24,9 @@ public class IterateCodeRequest {
      */
     @JsonProperty("prompt")
     private String prompt;
+    
+    // Optional — if null, targets the primary generated file
+    // If set, targets a different open file in the IDE session
+    @JsonProperty("targetFilePath")
+    private String targetFilePath;
 }

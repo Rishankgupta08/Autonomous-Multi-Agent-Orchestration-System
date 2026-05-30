@@ -146,6 +146,31 @@ public class WorkflowRun {
     @Column(name = "resume_from_step")
     private Integer resumeFromStep = 0;
 
+    /**
+     * GitHub owner (user/org login) captured at pause time.
+     * Used by WorkflowOrchestrator to push additional files without re-parsing the plan.
+     * Nullable — populated only when a workflow is paused for code review.
+     */
+    @Column(name = "pending_owner", length = 255)
+    private String pendingOwner;
+
+    /**
+     * GitHub repository name captured at pause time (e.g. "my-project").
+     * Used alongside pendingOwner to push additional files on approval.
+     * Nullable — populated only when a workflow is paused for code review.
+     */
+    @Column(name = "pending_repo", length = 255)
+    private String pendingRepo;
+
+    /**
+     * JSON map of additional file paths → content that the user modified in the
+     * IDE panel during code review.  Stored as TEXT because content can be large.
+     * Format: { "src/utils.py": "...content...", "README.md": "..." }
+     * Null when no additional files were included in the approval request.
+     */
+    @Column(name = "additional_files_json", columnDefinition = "TEXT")
+    private String additionalFilesJson;
+
     // -------------------------------------------------------------------------
     // Child steps
     // -------------------------------------------------------------------------

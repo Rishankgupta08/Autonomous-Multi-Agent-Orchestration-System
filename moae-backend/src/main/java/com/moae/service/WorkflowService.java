@@ -1,5 +1,7 @@
 package com.moae.service;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.moae.dto.ApproveCodeRequest;
 import com.moae.dto.IterateCodeRequest;
 import com.moae.dto.IterateCodeResponse;
@@ -7,11 +9,21 @@ import com.moae.dto.PendingCodeResponse;
 import com.moae.entity.WorkflowRun;
 import com.moae.enums.WorkflowStatus;
 import com.moae.repository.WorkflowRunRepository;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.moae.agent.IdeAgent;
+import com.moae.client.GitHubClient;
+import com.moae.ide.IdeSession;
+import com.moae.ide.IdeSessionRegistry;
+import com.moae.repository.UserRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.server.ResponseStatusException;
+
+import java.util.HashMap;
+import java.util.Map;
 
 import java.util.UUID;
 
@@ -42,6 +54,11 @@ public class WorkflowService {
     private final WorkflowRunRepository  workflowRunRepository;
     private final GroqLlmService         groqLlmService;
     private final WorkflowOrchestrator   workflowOrchestrator;
+    private final ObjectMapper           objectMapper;
+    private final IdeAgent               ideAgent;
+    private final IdeSessionRegistry     ideSessionRegistry;
+    private final GitHubClient           githubClient;
+    private final UserRepository         userRepository;
 
     // ─────────────────────────────────────────────────────────────────────────
     // 1. GET /api/workflow/{workflowId}/pending-code
@@ -97,6 +114,7 @@ public class WorkflowService {
      * @throws ResponseStatusException 404 if run not found / wrong user
      * @throws ResponseStatusException 409 if run is not in AWAITING_CODE_REVIEW
      */
+    @Transactional
     public IterateCodeResponse iterateCode(UUID workflowRunId, UUID userId,
                                            IterateCodeRequest request) {
         if (request.getPrompt() == null || request.getPrompt().isBlank()) {
@@ -104,55 +122,81 @@ public class WorkflowService {
                     "prompt field is required and cannot be blank");
         }
 
-        WorkflowRun run = findOwnedRun(workflowRunId, userId);
-
+        // 1. Load workflow and verify ownership
+        WorkflowRun run = workflowRunRepository.findByIdAndUserId(workflowRunId, userId)
+            .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND,
+                "Workflow not found"));
+        
         if (run.getStatus() != WorkflowStatus.AWAITING_CODE_REVIEW) {
             throw new ResponseStatusException(HttpStatus.CONFLICT,
-                    "Workflow is not awaiting code review (current status: "
-                    + run.getStatus().name() + ")");
+                "Workflow is not in code review state");
         }
-
-        String currentCode = run.getPendingCode();
-        String filePath    = run.getPendingFilePath() != null ? run.getPendingFilePath() : "file";
-
-        // Build an LLM prompt that provides the full current code as context
-        // and asks it to apply only the user's requested change.
-        String llmPrompt = """
-                You are modifying code based on a user's request.
-
-                Current code (%s):
-                ```
-                %s
-                ```
-
-                User's modification request: %s
-
-                STRICT RULES — follow exactly:
-                Return ONLY the complete updated file content.
-                No markdown, no backticks, no explanations.
-                Preserve all existing functionality unless explicitly told to remove it.
-                ZERO placeholder text (no TODO, no YOUR_CODE_HERE, no <...>).
-                The code must be complete, not a diff or a partial snippet.
-                """.formatted(filePath, currentCode, request.getPrompt());
-
-        log.info("iterateCode | workflowId={} | prompt={}", workflowRunId, request.getPrompt());
-        String updatedCode = groqLlmService.codeGeneratorCall(llmPrompt);
-
-        if (isPlaceholder(updatedCode)) {
-            throw new ResponseStatusException(HttpStatus.UNPROCESSABLE_ENTITY,
-                    "LLM failed to generate valid code, try rephrasing");
+        
+        // 2. Get or validate IdeSession
+        IdeSession session = ideSessionRegistry.get(workflowRunId.toString())
+            .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND,
+                "IDE session expired. Please restart the workflow."));
+        
+        // 3. Determine target file
+        // Default: primary file. But if request specifies a different file, use that.
+        String targetFile = request.getTargetFilePath() != null 
+            ? request.getTargetFilePath() 
+            : run.getPendingFilePath();
+        
+        log.info("WorkflowService.iterateCode | workflowId={} | target={} | " +
+                 "prompt='{}' | openFiles={}", 
+                 workflowRunId, targetFile, request.getPrompt(),
+                 session.getCurrentFiles().size());
+        
+        // 4. Delegate to IdeAgent
+        IdeAgent.IdeModifyResult result = ideAgent.modifyFile(
+            workflowRunId.toString(),
+            targetFile,
+            request.getPrompt()
+        );
+        
+        // 5. If target is the primary file, update DB pending_code
+        if (targetFile.equals(run.getPendingFilePath())) {
+            run.setPendingCode(result.updatedCode());
+            workflowRunRepository.save(run);
         }
-
-        // Persist updated code back to DB so the next call (iterate or approve)
-        // always sees the latest version.
-        run.setPendingCode(updatedCode);
-        workflowRunRepository.save(run);
-        log.info("iterateCode | saved updated pendingCode | length={}", updatedCode.length());
-
+        // If target is a secondary file, store in additionalFilesJson
+        else {
+            updateAdditionalFile(run, targetFile, result.updatedCode());
+            workflowRunRepository.save(run);
+        }
+        
+        // 6. Build response message
+        String message;
+        if (result.charDiff() == 0) {
+            message = "⚠️ No changes detected. Try being more specific.";
+        } else if (result.charDiff() > 0) {
+            message = "✓ Updated " + targetFile.split("/")[targetFile.split("/").length - 1]
+                    + " (+" + result.charDiff() + " chars)";
+        } else {
+            message = "✓ Updated " + targetFile.split("/")[targetFile.split("/").length - 1]
+                    + " (" + result.charDiff() + " chars, code simplified)";
+        }
+        
         return IterateCodeResponse.builder()
-                .updatedCode(updatedCode)
-                .message("Code updated. Review the changes.")
+                .updatedCode(result.updatedCode())
+                .message(message)
                 .build();
+    }
+
+    // Helper — update or add a file in additionalFilesJson
+    private void updateAdditionalFile(WorkflowRun run, String filePath, String content) {
+        try {
+            Map<String, String> files = new HashMap<>();
+            if (run.getAdditionalFilesJson() != null && !run.getAdditionalFilesJson().isBlank()) {
+                files = objectMapper.readValue(run.getAdditionalFilesJson(),
+                    new TypeReference<>() {});
+            }
+            files.put(filePath, content);
+            run.setAdditionalFilesJson(objectMapper.writeValueAsString(files));
+        } catch (JsonProcessingException e) {
+            log.error("Failed to update additionalFilesJson: {}", e.getMessage());
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -193,14 +237,65 @@ public class WorkflowService {
         // Even if the user edited nothing, we overwrite with what they sent so the
         // source of truth is always the explicitly approved version.
         run.setPendingCode(request.getApprovedCode());
+
+        // Persist additional files JSON so the orchestrator can push them on resume
+        if (request.getAdditionalFiles() != null && !request.getAdditionalFiles().isEmpty()) {
+            try {
+                String json = objectMapper.writeValueAsString(request.getAdditionalFiles());
+                run.setAdditionalFilesJson(json);
+                log.info("approveCode | {} additional files approved",
+                        request.getAdditionalFiles().size());
+            } catch (JsonProcessingException e) {
+                log.warn("approveCode | failed to serialize additionalFiles: {}", e.getMessage());
+            }
+        }
+
         run.setStatus(WorkflowStatus.RUNNING);  // back to RUNNING while pipeline resumes
         workflowRunRepository.save(run);
 
         log.info("approveCode | workflowId={} | resumeFromStep={} | codeLength={}",
                 workflowRunId, run.getResumeFromStep(), request.getApprovedCode().length());
 
+        // Cleanup IDE session — it has served its purpose
+        ideSessionRegistry.remove(workflowRunId.toString());
+        log.info("WorkflowService.approveCode | IdeSession cleaned up for workflowId={}", workflowRunId);
+
         // Hand off to orchestrator — runs @Async on the thread pool
         workflowOrchestrator.resumeFromCodeApproval(workflowRunId, userId);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 4. GET /api/workflow/{workflowId}/repo-file
+    // ─────────────────────────────────────────────────────────────────────────
+
+    @Transactional(readOnly = true)
+    public Map<String, String> getRepoFile(UUID workflowId, UUID userId, String filePath) {
+        WorkflowRun run = workflowRunRepository.findByIdAndUserId(workflowId, userId)
+            .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Not found"));
+        
+        // Fetch from GitHub
+        String token = userRepository.findById(userId)
+            .orElseThrow().getGithubAccessToken();
+        
+        com.moae.client.dto.GitHubFileResponse fileData = githubClient.getFile(
+            run.getPendingOwner(), run.getPendingRepo(), filePath, token
+        );
+        
+        String content = fileData.content();
+        String language = detectLanguage(filePath);
+        
+        // Register in IdeSession so future iterate calls can use it as context
+        ideSessionRegistry.get(workflowId.toString()).ifPresent(session -> {
+            session.registerFile(filePath, content);
+            log.info("WorkflowService.getRepoFile | registered '{}' in IdeSession | {} chars",
+                filePath, content.length());
+        });
+        
+        Map<String, String> result = new HashMap<>();
+        result.put("content", content);
+        result.put("language", language);
+        result.put("filePath", filePath);
+        return result;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -255,5 +350,26 @@ public class WorkflowService {
         if (lower.endsWith(".md"))   return "markdown";
         if (lower.endsWith(".sh"))   return "shell";
         return "plaintext";
+    }
+
+    /**
+     * Strips markdown code block formatting if the LLM ignored instructions
+     * and wrapped the output in ```language ... ```.
+     */
+    private String stripMarkdown(String text) {
+        if (text == null) return null;
+        text = text.trim();
+        if (text.startsWith("```")) {
+            int firstNewline = text.indexOf('\n');
+            if (firstNewline != -1) {
+                text = text.substring(firstNewline + 1);
+            } else {
+                text = ""; // Just a block with no content
+            }
+        }
+        if (text.endsWith("```")) {
+            text = text.substring(0, text.length() - 3).trim();
+        }
+        return text;
     }
 }

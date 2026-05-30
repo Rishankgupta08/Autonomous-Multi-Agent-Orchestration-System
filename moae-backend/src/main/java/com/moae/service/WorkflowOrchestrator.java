@@ -1,18 +1,22 @@
 package com.moae.service;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.moae.agent.ExecutorAgent;
 import com.moae.agent.PlannerAgent;
 import com.moae.agent.VerifierAgent;
 import com.moae.agent.dto.StepResult;
 import com.moae.agent.dto.VerificationResult;
+import com.moae.client.GitHubClient;
 import com.moae.dto.UserDefaultsDTO;
+import com.moae.entity.User;
 import com.moae.entity.WorkflowRun;
 import com.moae.entity.WorkflowStep;
 import com.moae.enums.StepStatus;
 import com.moae.enums.WorkflowStatus;
 import com.moae.repository.UserIntegrationRepository;
+import com.moae.repository.UserRepository;
 import com.moae.repository.WorkflowRunRepository;
 import com.moae.repository.WorkflowStepRepository;
 import com.moae.sse.SseEmitterRegistry;
@@ -76,35 +80,10 @@ public class WorkflowOrchestrator {
     private final com.moae.client.JiraClient jiraClient;
     private final UserIntegrationRepository userIntegrationRepository;
     private final UserDefaultsService userDefaultsService;
-
-    private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
-    private final Map<String, ScheduledFuture<?>> activeHeartbeats = new ConcurrentHashMap<>();
-
-    private void startHeartbeat(String workflowId) {
-        ScheduledFuture<?> heartbeat = scheduler.scheduleAtFixedRate(() -> {
-            try {
-                boolean sent = sseEmitterRegistry.send(workflowId, "heartbeat", Map.of("t", System.currentTimeMillis()));
-                if (!sent) {
-                    cancelHeartbeat(workflowId);
-                }
-            } catch (Exception ignored) {
-                cancelHeartbeat(workflowId);
-            }
-        }, 0, 20, TimeUnit.SECONDS);
-        activeHeartbeats.put(workflowId, heartbeat);
-    }
-
-    private void cancelHeartbeat(String workflowId) {
-        ScheduledFuture<?> heartbeat = activeHeartbeats.remove(workflowId);
-        if (heartbeat != null) {
-            heartbeat.cancel(false);
-        }
-    }
-
-    @PreDestroy
-    public void cleanup() {
-        scheduler.shutdownNow();
-    }
+    private final GitHubClient gitHubClient;
+    private final UserRepository userRepository;
+    private final com.moae.ide.IdeSessionRegistry ideSessionRegistry;
+    private final com.moae.sse.HeartbeatRegistry heartbeatRegistry;
 
     /**
      * Executes the full pipeline on a Spring @Async thread pool thread.
@@ -186,7 +165,6 @@ public class WorkflowOrchestrator {
             run = workflowRunRepository.findById(run.getId()).orElse(run);
             if (run.getStatus() == WorkflowStatus.AWAITING_CODE_REVIEW) {
                 log.info("Workflow {} paused for code review. Orchestrator exiting early.", workflowId);
-                startHeartbeat(workflowId);
                 return;
             }
 
@@ -208,7 +186,8 @@ public class WorkflowOrchestrator {
     public void resumeFromCodeApproval(UUID workflowRunId, UUID userId) {
         String workflowId = workflowRunId.toString();
         log.info("ORCHESTRATOR RESUMING: {}", workflowId);
-        cancelHeartbeat(workflowId);
+        heartbeatRegistry.cancel(workflowId);
+        log.info("resumeFromCodeApproval | heartbeat cancelled for {}", workflowId);
         try {
             WorkflowRun run = workflowRunRepository
                     .findById(workflowRunId)
@@ -216,6 +195,21 @@ public class WorkflowOrchestrator {
 
             sseEmitterRegistry.send(workflowId, "log",
                     Map.of("msg", "Resuming execution after code approval...", "cls", "ok"));
+
+            // Restore IdeSession from DB state if missing
+            if (ideSessionRegistry.get(workflowId).isEmpty()) {
+                log.warn("resumeFromCodeApproval | IdeSession missing — restoring from DB");
+                com.moae.ide.IdeSession restored = new com.moae.ide.IdeSession(
+                    workflowId,
+                    run.getPendingOwner(),
+                    run.getPendingRepo(),
+                    run.getPendingBranchName() != null ? run.getPendingBranchName() : "main",
+                    run.getPendingFilePath(),
+                    run.getPendingCode(),       // approved code from DB
+                    "Restored session"
+                );
+                ideSessionRegistry.register(workflowId, restored);
+            }
 
             // 1. Reconstruct the plan
             List<WorkflowStep> steps = workflowStepRepository.findByWorkflowRunIdOrderByStepIdAsc(workflowRunId);
@@ -250,7 +244,48 @@ public class WorkflowOrchestrator {
                 }
             }
 
-            // 3. Resume execution
+            // 3. Push additional files to the branch (if any were included in approval)
+            if (run.getAdditionalFilesJson() != null && !run.getAdditionalFilesJson().isBlank()) {
+                try {
+                    Map<String, String> additionalFiles = objectMapper.readValue(
+                            run.getAdditionalFilesJson(), new TypeReference<>() {});
+
+                    // Resolve GitHub credentials for the file pushes
+                    User user = userRepository.findById(userId)
+                            .orElseThrow(() -> new RuntimeException("User not found: " + userId));
+                    String githubToken = user.getGithubAccessToken();
+                    String owner = run.getPendingOwner() != null ? run.getPendingOwner() : user.getGithubLogin();
+                    String repo  = run.getPendingRepo()  != null ? run.getPendingRepo()  : "";
+                    String branch = run.getPendingBranchName() != null ? run.getPendingBranchName() : "main";
+
+                    for (Map.Entry<String, String> entry : additionalFiles.entrySet()) {
+                        String filePath = entry.getKey();
+                        String content  = entry.getValue();
+                        try {
+                            // Auto-fetch SHA in case the file already exists on the branch
+                            String fileSha = null;
+                            try {
+                                fileSha = gitHubClient.getFile(owner, repo, filePath, githubToken).sha();
+                            } catch (Exception ignored) {
+                                // New file — SHA stays null
+                            }
+                            gitHubClient.pushFile(
+                                    owner, repo, filePath, content,
+                                    "MOAE: Update " + filePath,
+                                    branch, fileSha, githubToken);
+                            log.info("resumeFromCodeApproval | pushed additional file: {}", filePath);
+                        } catch (Exception pushEx) {
+                            log.warn("resumeFromCodeApproval | failed to push additional file {}: {}",
+                                    filePath, pushEx.getMessage());
+                        }
+                    }
+                } catch (Exception parseEx) {
+                    log.warn("resumeFromCodeApproval | could not parse additionalFilesJson: {}",
+                            parseEx.getMessage());
+                }
+            }
+
+            // 4. Resume execution
             List<StepResult> newResults = executorAgent.resume(
                     plan, run.getId(), userId, workflowId, run.getResumeFromStep(), run.getPendingCode());
 

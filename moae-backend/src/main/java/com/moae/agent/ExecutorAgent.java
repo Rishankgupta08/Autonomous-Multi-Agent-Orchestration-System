@@ -12,6 +12,8 @@ import com.moae.agent.dto.StepResult;
 import com.moae.entity.User;
 import com.moae.entity.WorkflowRun;
 import com.moae.entity.WorkflowStep;
+import com.moae.ide.IdeSession;
+import com.moae.ide.IdeSessionRegistry;
 import com.moae.enums.FailureReason;
 import com.moae.enums.IntegrationType;
 import com.moae.enums.StepStatus;
@@ -20,6 +22,8 @@ import com.moae.repository.UserIntegrationRepository;
 import com.moae.repository.UserRepository;
 import com.moae.repository.WorkflowStepRepository;
 import com.moae.repository.WorkflowRunRepository;
+import com.moae.repository.UserDefaultsRepository;
+import com.moae.entity.UserDefaults;
 import com.moae.service.GroqLlmService;
 import com.moae.sse.SseEmitterRegistry;
 import lombok.RequiredArgsConstructor;
@@ -68,8 +72,12 @@ public class ExecutorAgent {
     private final UserIntegrationRepository userIntegrationRepository;
     private final WorkflowStepRepository workflowStepRepository;
     private final WorkflowRunRepository workflowRunRepository;
+    private final UserDefaultsRepository userDefaultsRepository;
     private final SseEmitterRegistry sseEmitterRegistry;
     private final ObjectMapper objectMapper;
+    private final IdeSessionRegistry ideSessionRegistry;
+    private final org.springframework.scheduling.TaskScheduler taskScheduler;
+    private final com.moae.sse.HeartbeatRegistry heartbeatRegistry;
 
     /**
      * Executes every step in the plan sequentially.
@@ -131,11 +139,16 @@ public class ExecutorAgent {
                 .findById(workflowRunId)
                 .orElseThrow(() -> new RuntimeException("WorkflowRun not found: " + workflowRunId));
 
+        UserDefaults defaultsEntity = userDefaultsRepository.findByUserId(userId).orElse(null);
+
         String generatedCode = initialGeneratedCode;        // carries LLM output from generateCode → pushFile
         String fetchedFileContent = null;   // carries file content from getFile → generateCode
         String fetchedFilePath = null;      // carries file path from getFile → generateCode
         // tracks the branch created in a prior createBranch step for use in pause metadata
         String lastCreatedBranch = null;
+        // tracks owner/repo seen in any github step so the generateCode pre-fetch can use them
+        String lastKnownOwner = githubOwner;  // default to authenticated user's login
+        String lastKnownRepo  = "";
 
         List<StepResult> results = new ArrayList<>();
 
@@ -160,9 +173,54 @@ public class ExecutorAgent {
 
             // ── TRY: execute the step ─────────────────────────────────────────
             try {
+                // ── Pre-generateCode: emit repo file tree + optionally pre-fetch target file ──
+                if ("generateCode".equals(action)) {
+                    String gcOwner    = params != null && params.containsKey("owner")
+                                        ? (String) params.get("owner") : lastKnownOwner;
+                    String gcRepo     = params != null && params.containsKey("repo")
+                                        ? (String) params.get("repo")  : lastKnownRepo;
+                    String gcFilePath = params != null
+                                        ? (String) params.getOrDefault("filePath", "") : "";
+
+                    // Step A: fetch the repo file tree and emit it so the frontend
+                    // can display it in the code-review panel.
+                    try {
+                        List<Map<String, Object>> fileTree =
+                                gitHubClient.getFileTree(gcOwner, gcRepo, "main", githubToken);
+                        sseEmitterRegistry.send(workflowId, "repo_tree_ready", Map.of(
+                                "owner",      gcOwner,
+                                "repo",       gcRepo,
+                                "fileTree",   fileTree,
+                                "targetFile", gcFilePath
+                        ));
+                        log.info("generateCode | emitted repo_tree_ready | {} files", fileTree.size());
+                    } catch (Exception treeEx) {
+                        // Non-critical — log and continue without the tree
+                        log.warn("generateCode | failed to fetch repo file tree: {}", treeEx.getMessage());
+                    }
+
+                    // Step B: if no getFile step ran yet, try to pre-fetch the target file
+                    // so the LLM has its existing content as context.
+                    if (!gcFilePath.isBlank() && fetchedFileContent == null && !gcRepo.isBlank()) {
+                        try {
+                            com.moae.client.dto.GitHubFileResponse existing =
+                                    gitHubClient.getFile(gcOwner, gcRepo, gcFilePath, githubToken);
+                            fetchedFileContent = existing.content();
+                            fetchedFilePath    = gcFilePath;
+                            log.info("generateCode | pre-fetched existing file: {} ({} chars)",
+                                    gcFilePath, fetchedFileContent.length());
+                        } catch (Exception fileEx) {
+                            // File doesn't exist yet (new file) — not an error
+                            log.info("generateCode | file not found in repo (new file): {}", gcFilePath);
+                        }
+                    }
+                }
+
                 String resultJson = routeStep(tool, action, params,
                         githubToken, githubOwner, jiraConfig, slackConfig,
-                        generatedCode, fetchedFileContent, fetchedFilePath);
+                        generatedCode, fetchedFileContent, fetchedFilePath,
+                        defaultsEntity, workflowRun.getGoal());
+
 
                 // Track fetched file content for subsequent generateCode steps
                 if ("getFile".equals(action) && resultJson != null) {
@@ -184,7 +242,13 @@ public class ExecutorAgent {
                     }
                 }
 
-                // ── generateCode SUCCESS → pause for human review ─────────────
+                // Track owner/repo from any github step so generateCode can use them
+                if (params != null) {
+                    if (params.containsKey("owner")) lastKnownOwner = (String) params.get("owner");
+                    if (params.containsKey("repo"))  lastKnownRepo  = (String) params.get("repo");
+                }
+
+                // ── generateCode SUCCESS → pause for human review —————————————
                 if ("generateCode".equals(action) && resultJson != null) {
 
                     // Unwrap the generated code string from the JSON envelope
@@ -198,8 +262,52 @@ public class ExecutorAgent {
                         rawCode = resultJson; // fallback: use raw string
                     }
 
-                    if (!isPlaceholder(rawCode)) {
-                        // ── Persist SUCCESS for the generateCode step itself ──
+                    if (rawCode == null || rawCode.isBlank()) {
+                        throw new MoaeClientException(
+                                "generateCode: LLM returned empty response",
+                                FailureReason.CLIENT_ERROR, 0);
+                    }
+
+                    if (isPlaceholder(rawCode)) {
+                        // Retry ONCE with stricter prompt before giving up
+                        log.warn("generateCode | placeholder detected on attempt 1 — retrying with stricter prompt");
+                        
+                        String instruction = params != null ? (String) params.getOrDefault("instruction", "") : "";
+                        String pauseFilePath = fetchedFilePath != null ? fetchedFilePath : "unknown file";
+                        String contextBlock = (fetchedFileContent != null)
+                                ? "EXISTING FILE TO MODIFY:\n```\n" + fetchedFileContent + "\n```\n"
+                                : "CREATE A NEW FILE FROM SCRATCH.\n";
+                                
+                        String strictPrompt = "IMPORTANT: Return ONLY real code. No placeholders. No angle brackets.\n\n" +
+                                "You are a professional software engineer. Your output will be committed DIRECTLY to a GitHub repository — a human will review it before push.\n\n" +
+                                contextBlock + "File path: " + pauseFilePath + "\nTask: " + instruction + "\n\n" +
+                                "STRICT RULES — violation means the build fails:\n" +
+                                "1. Return ONLY the raw file content. Nothing else.\n" +
+                                "2. ZERO placeholder text of any kind:\n" +
+                                "   no TODO, no YOUR_CODE_HERE, no GENERATED_CODE,\n" +
+                                "   no <...>, no \"add your implementation here\",\n" +
+                                "   no angle-bracket tokens, no PASTE_HERE.\n" +
+                                "3. No markdown code fences or backticks.\n" +
+                                "4. No explanatory text before or after the code.\n" +
+                                "5. The code must be complete and immediately runnable.\n" +
+                                "6. For HTML: include full DOCTYPE, head with meta/title, complete body.\n" +
+                                "7. For Python: include all imports, no stub functions.\n" +
+                                "8. Keep ALL existing code unless the task explicitly says to remove it.\n" +
+                                "9. If adding a function, preserve all existing functions.";
+
+                        rawCode = groqLlmService.codeGeneratorCall(strictPrompt);
+                        rawCode = stripMarkdown(rawCode);
+                        
+                        if (isPlaceholder(rawCode)) {
+                            throw new MoaeClientException(
+                                "generateCode: LLM returned placeholder on both attempts. Check instruction clarity.",
+                                FailureReason.CLIENT_ERROR, 0);
+                        }
+                    }
+
+                    generatedCode = rawCode;
+
+                    // ── Persist SUCCESS for the generateCode step itself ──
                         long timeTaken = System.currentTimeMillis() - startTime;
                         workflowStep.setStatus(StepStatus.SUCCESS);
                         workflowStep.setResultJson(resultJson);
@@ -251,17 +359,6 @@ public class ExecutorAgent {
                         }
                         if (pauseBranch == null) pauseBranch = "main";
 
-                        // ── Save pending code to WorkflowRun ──────────────────
-                        workflowRun.setPendingCode(rawCode);
-                        workflowRun.setPendingFilePath(pauseFilePath);
-                        workflowRun.setPendingBranchName(pauseBranch);
-                        workflowRun.setResumeFromStep(workflowStep.getStepId() + 1); // next step
-                        workflowRun.setStatus(WorkflowStatus.AWAITING_CODE_REVIEW);
-                        workflowRunRepository.save(workflowRun);
-
-                        log.info("Workflow {} PAUSED for code review | file={} | branch={} | resumeFrom={}",
-                                workflowId, pauseFilePath, pauseBranch, workflowStep.getStepId() + 1);
-
                         // ── Detect Python overrides ──────────────────────────────
                         String detectedLang = detectLanguage(pauseFilePath);
                         if (rawCode.startsWith("import tkinter") || 
@@ -270,24 +367,68 @@ public class ExecutorAgent {
                             detectedLang = "python";
                         }
 
-                        // ── Emit code_review_ready SSE event ─────────────────
-                        // Frontend switches to the code-review panel on receipt of this event.
-                        sseEmitterRegistry.send(workflowId, "code_review_ready",
-                                Map.of(
-                                        "code",     rawCode,
-                                        "filePath", pauseFilePath,
-                                        "language", detectedLang,
-                                        "message",  "AI has written the code. " +
-                                                    "Review and modify before pushing to GitHub."
-                                ));
-
-                        // Stop execution here — resumeFromCodeApproval() continues from this point
+                        // === HANDOFF TO IDE AGENT ===
+                        String instruction = params != null ? (String) params.getOrDefault("instruction", "") : "";
+                        
+                        // 1. Create IdeSession with the generated code as the primary file
+                        IdeSession ideSession = new IdeSession(
+                            workflowId,
+                            lastKnownOwner,
+                            lastKnownRepo,
+                            pauseBranch,                   // branch
+                            pauseFilePath,                 // primary file being worked on
+                            rawCode,                       // the AI-generated code
+                            instruction                    // original task instruction from step params
+                        );
+                        
+                        // 2. If the plan had a preceding getFile step, 
+                        //    register that file's original content too
+                        if (fetchedFileContent != null && !fetchedFileContent.equals(rawCode)) {
+                            ideSession.registerFile(pauseFilePath, fetchedFileContent);
+                            // Then update to show the AI-generated version as current
+                            ideSession.updateFile(pauseFilePath, rawCode);
+                        }
+                        
+                        // 3. Register session
+                        ideSessionRegistry.register(workflowId, ideSession);
+                        log.info("ExecutorAgent | IdeSession created for workflowId={} | primaryFile={} | " +
+                                 "owner={} | repo={}", workflowId, pauseFilePath, lastKnownOwner, lastKnownRepo);
+                        
+                        // 4. Save pause state to DB
+                        workflowRun.setPendingCode(rawCode);
+                        workflowRun.setPendingFilePath(pauseFilePath);
+                        workflowRun.setPendingBranchName(pauseBranch);
+                        workflowRun.setPendingOwner(lastKnownOwner);
+                        workflowRun.setPendingRepo(lastKnownRepo);
+                        workflowRun.setResumeFromStep(workflowStep.getStepId() + 1);
+                        workflowRun.setStatus(WorkflowStatus.AWAITING_CODE_REVIEW);
+                        workflowRunRepository.save(workflowRun);
+                        log.info("ExecutorAgent | workflow paused | resumeFromStep={}", workflowStep.getStepId() + 1);
+                        
+                        // 5. Emit SSE to frontend with full context
+                        sseEmitterRegistry.send(workflowId, "code_review_ready", Map.of(
+                            "code",       rawCode,
+                            "filePath",   pauseFilePath,
+                            "language",   detectedLang,
+                            "owner",      lastKnownOwner,
+                            "repo",       lastKnownRepo,
+                            "message",    "IDE Agent ready. Review and modify before pushing to GitHub."
+                        ));
+                        
+                        java.util.concurrent.ScheduledFuture<?> heartbeat = taskScheduler.scheduleAtFixedRate(() -> {
+                            try {
+                                WorkflowRun current = workflowRunRepository.findById(workflowRun.getId()).orElse(null);
+                                if (current == null || !"AWAITING_CODE_REVIEW".equals(current.getStatus())) {
+                                    return;
+                                }
+                                sseEmitterRegistry.send(workflowId, "heartbeat", Map.of("t", System.currentTimeMillis()));
+                            } catch (Exception e) {
+                            }
+                        }, java.time.Instant.now().plusSeconds(20), java.time.Duration.ofSeconds(20));
+                        heartbeatRegistry.register(workflowId, heartbeat);
+                        
+                        // 6. STOP execute() — IdeAgent now handles everything until approve
                         return results;
-                    }
-                    // If it IS a placeholder the step will have been caught and thrown
-                    // inside routeStep() → falls through to the normal SUCCESS path
-                    // (which should not be reached, but kept for safety).
-                    generatedCode = resultJson;
                 }
 
                 // Normal SUCCESS handling for all non-generateCode steps
@@ -406,7 +547,8 @@ public class ExecutorAgent {
             String githubToken, String githubOwner,
             Map<String, Object> jiraConfig, Map<String, Object> slackConfig,
             String generatedCode,
-            String fetchedFileContent, String fetchedFilePath) throws JsonProcessingException {
+            String fetchedFileContent, String fetchedFilePath,
+            UserDefaults defaultsEntity, String goalText) throws JsonProcessingException {
 
         // Inline param extractor helper
         java.util.function.BiFunction<String, String, String> p = (key, fallback) -> params != null
@@ -560,6 +702,8 @@ public class ExecutorAgent {
                     }
                     case "updateStatus" -> {
                         String issueId = p.apply("issueId", "");
+                        String defaultJiraProject = defaultsEntity != null ? defaultsEntity.getJiraProjectKey() : null;
+                        issueId = normalizeJiraIssueId(issueId, defaultJiraProject);
 
                         String transitionParam = !p.apply("transitionName", "").isBlank()
                                 ? p.apply("transitionName", "")
@@ -585,6 +729,9 @@ public class ExecutorAgent {
                 switch (action) {
                     case "sendMessage" -> {
                         String channel = p.apply("channel", "");
+                        String defaultSlackChannel = defaultsEntity != null ? defaultsEntity.getSlackDefaultChannel() : null;
+                        channel = normalizeSlackChannel(channel, goalText, defaultSlackChannel);
+
                         String text = p.apply("text", "");
                         slackClient.sendMessage(botToken, channel, text);
                         return "{\"status\":\"success\"}";
@@ -630,21 +777,7 @@ public class ExecutorAgent {
                                 """.formatted(contextBlock, filePath, instruction);
 
                         String generatedResult = groqLlmService.codeGeneratorCall(codePrompt);
-
-                        // Validate — reject placeholder responses and retry once
-                        if (isPlaceholder(generatedResult)) {
-                            log.warn("generateCode: Groq returned placeholder text — retrying once");
-                            String retry = groqLlmService.codeGeneratorCall(
-                                    "IMPORTANT: Return ONLY real code. No placeholders. No angle brackets.\n\n"
-                                            + codePrompt);
-                            if (isPlaceholder(retry)) {
-                                throw new MoaeClientException(
-                                        "Code generation produced invalid placeholder output after retry",
-                                        FailureReason.SERVER_ERROR, 0);
-                            }
-                            return objectMapper.writeValueAsString(
-                                    Map.of("generatedCode", retry));
-                        }
+                        generatedResult = stripMarkdown(generatedResult);
 
                         return objectMapper.writeValueAsString(
                                 Map.of("generatedCode", generatedResult));
@@ -734,5 +867,60 @@ public class ExecutorAgent {
         if (lower.endsWith(".md"))   return "markdown";
         if (lower.endsWith(".sh"))   return "shell";
         return "plaintext";
+    }
+
+    /**
+     * Strips markdown code block formatting if the LLM ignored instructions
+     * and wrapped the output in ```language ... ```.
+     */
+    private String stripMarkdown(String text) {
+        if (text == null) return null;
+        text = text.trim();
+        if (text.startsWith("```")) {
+            int firstNewline = text.indexOf('\n');
+            if (firstNewline != -1) {
+                text = text.substring(firstNewline + 1);
+            } else {
+                text = ""; // Just a block with no content
+            }
+        }
+        if (text.endsWith("```")) {
+            text = text.substring(0, text.length() - 3).trim();
+        }
+        return text;
+    }
+
+    private String normalizeJiraIssueId(String issueId, String defaultProject) {
+        if (issueId == null || issueId.isBlank()) return issueId;
+        String trimmed = issueId.trim();
+        if (trimmed.matches("\\d+")) {
+            if (defaultProject != null && !defaultProject.isBlank()) {
+                String normalized = defaultProject.toUpperCase().trim() + "-" + trimmed;
+                log.info("ExecutorAgent | normalized bare number Jira ID to: {}", normalized);
+                return normalized;
+            }
+        }
+        return trimmed;
+    }
+
+    private String normalizeSlackChannel(String channel, String goal, String defaultChannel) {
+        if (channel == null || channel.isBlank()) {
+            return defaultChannel != null ? defaultChannel : "#general";
+        }
+        String normalized = channel.trim().toLowerCase();
+        if (!normalized.startsWith("#")) {
+            normalized = "#" + normalized;
+        }
+        
+        if (goal != null) {
+            String goalLower = goal.toLowerCase();
+            String chanNoHash = normalized.replace("#", "");
+            if (!goalLower.contains(chanNoHash)) {
+                log.warn("ExecutorAgent | channel '{}' hallucinated (not in goal text), overriding with default '{}'",
+                        normalized, defaultChannel);
+                return defaultChannel != null ? defaultChannel : "#general";
+            }
+        }
+        return normalized;
     }
 }
