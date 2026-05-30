@@ -6,6 +6,7 @@ import { useIntegrationStore } from '../store/integrationStore';
 import Input from '../components/common/Input';
 import Button from '../components/common/Button';
 import StatusChip from '../components/common/StatusChip';
+import WorkspaceDefaultsCard from '../components/WorkspaceDefaultsCard';
 import { fadeUp, staggerContainer } from '../lib/animations';
 import { Loader2 } from 'lucide-react';
 
@@ -83,6 +84,11 @@ export default function IntegrationsPage() {
           </svg>
           <span className="text-[13px] font-mono text-[#888]">github.com/{user?.githubLogin}</span>
           <StatusChip variant="connected-green" />
+        </motion.div>
+
+        {/* Workspace Defaults */}
+        <motion.div variants={fadeUp} className="mb-6">
+          <WorkspaceDefaultsCard />
         </motion.div>
 
         {/* Jira Integration */}

@@ -48,11 +48,29 @@ interface WorkflowState {
   history: HistoryItem[];
   historyLoading: boolean;
 
+  // Code Review (Human in the loop)
+  codeReviewActive: boolean;
+  pendingCode: string | null;
+  pendingFilePath: string | null;
+  pendingLanguage: string | null;
+  isIterating: boolean;
+  isApproving: boolean;
+  iterationChat: Array<{
+    id: string;
+    role: 'user' | 'ai';
+    content: string;
+    timestamp: Date;
+  }>;
+
   // Actions
   setGoal: (goal: string) => void;
   executeWorkflow: (goal: string) => Promise<void>;
   fetchHistory: () => Promise<void>;
   reset: () => void;
+  activateCodeReview: (code: string, filePath: string, language: string) => void;
+  iterateCode: (workflowId: string, prompt: string) => Promise<void>;
+  approveCode: (workflowId: string, finalCode: string) => Promise<void>;
+  lastIterationAt: number;
 }
 
 // ── Store ─────────────────────────────────────────────────────────────
@@ -71,6 +89,15 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
   history: [],
   historyLoading: false,
 
+  codeReviewActive: false,
+  pendingCode: null,
+  pendingFilePath: null,
+  pendingLanguage: null,
+  isIterating: false,
+  isApproving: false,
+  iterationChat: [],
+  lastIterationAt: 0,
+
   setGoal: (goal) => set({ goal }),
 
   reset: () => {
@@ -88,6 +115,14 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
       score: null,
       overallStatus: null,
       error: null,
+      codeReviewActive: false,
+      pendingCode: null,
+      pendingFilePath: null,
+      pendingLanguage: null,
+      isIterating: false,
+      isApproving: false,
+      iterationChat: [],
+      lastIterationAt: 0,
     });
   },
 
@@ -117,6 +152,17 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
     // Step 2: Open SSE stream
     const es = workflowApi.stream(workflowId);
     activeEventSource = es;
+
+    // ── code_review_ready: human in the loop code review ──────────────
+    es.addEventListener('code_review_ready', (e) => {
+      const data = JSON.parse(e.data);
+      get().activateCodeReview(data.code, data.filePath, data.language);
+    });
+
+    // ── heartbeat: keep connection alive ──────────────────────────────
+    es.addEventListener('heartbeat', () => {
+      // just keeping the connection alive — no action needed
+    });
 
     // ── plan_ready: build initial step list from AI plan ─────────────
     es.addEventListener('plan_ready', (e) => {
@@ -180,6 +226,8 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
         phase,
         score,
         overallStatus: overallStatus === 'SUCCESS' ? 'SUCCESS' : 'FAIL',
+        codeReviewActive: false,
+        pendingCode: null,
       });
 
       es.close();
@@ -201,6 +249,106 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
       set({ history, historyLoading: false });
     } catch {
       set({ historyLoading: false });
+    }
+  },
+
+  activateCodeReview: (code: string, filePath: string, language: string) => {
+    set({
+      codeReviewActive: true,
+      pendingCode: code,
+      pendingFilePath: filePath,
+      pendingLanguage: language,
+      iterationChat: [],
+    });
+  },
+
+  iterateCode: async (workflowId: string, prompt: string) => {
+    const userMsg = { id: crypto.randomUUID(), role: 'user' as const, content: prompt, timestamp: new Date() };
+    set((state) => ({
+      iterationChat: [...state.iterationChat, userMsg],
+      isIterating: true,
+    }));
+
+    try {
+      const response = await fetch(`/api/workflow/${workflowId}/iterate-code`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ prompt }),
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        const charDiff = Math.abs(data.updatedCode.length - (get().pendingCode?.length || 0));
+        const responseMessage = charDiff < 20 
+          ? '⚠️ No significant changes detected. Try rephrasing your request.'
+          : '✓ Code updated — see the changes in the editor.';
+
+        const aiMsg = {
+          id: crypto.randomUUID(),
+          role: 'ai' as const,
+          content: responseMessage,
+          timestamp: new Date()
+        };
+        set((state) => ({
+          pendingCode: data.updatedCode,
+          iterationChat: [...state.iterationChat, aiMsg],
+          isIterating: false,
+          lastIterationAt: Date.now(),
+        }));
+      } else {
+        const aiMsg = {
+          id: crypto.randomUUID(),
+          role: 'ai' as const,
+          content: 'Failed to update. Try rephrasing.',
+          timestamp: new Date()
+        };
+        set((state) => ({
+          iterationChat: [...state.iterationChat, aiMsg],
+          isIterating: false,
+        }));
+      }
+    } catch (err) {
+      const aiMsg = {
+        id: crypto.randomUUID(),
+        role: 'ai' as const,
+        content: 'Failed to update due to network error.',
+        timestamp: new Date()
+      };
+      set((state) => ({
+        iterationChat: [...state.iterationChat, aiMsg],
+        isIterating: false,
+      }));
+    }
+  },
+
+  approveCode: async (workflowId: string, finalCode: string) => {
+    set({ isApproving: true });
+    try {
+      const response = await fetch(`/api/workflow/${workflowId}/approve-code`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ approvedCode: finalCode }),
+      });
+
+      if (!response.ok) {
+        const text = await response.text();
+        console.error('approveCode failed:', response.status, text);
+        alert('Failed to approve code: ' + text);
+        set({ isApproving: false });
+        return;
+      }
+
+      set({
+        codeReviewActive: false,
+        pendingCode: null,
+        isApproving: false,
+      });
+    } catch (err) {
+      console.error('approveCode network error:', err);
+      set({ isApproving: false });
+      alert('Network error while approving code.');
     }
   },
 }));

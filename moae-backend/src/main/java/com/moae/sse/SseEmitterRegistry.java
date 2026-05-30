@@ -61,11 +61,11 @@ public class SseEmitterRegistry {
      * @param eventName  SSE event name (e.g. "log", "plan_ready", "workflow_complete")
      * @param data       event payload — serialized as application/json
      */
-    public void send(UUID workflowId, String eventName, Object data) {
+    public boolean send(UUID workflowId, String eventName, Object data) {
         SseEmitter emitter = emitters.get(workflowId);
         if (emitter == null) {
             log.warn("No emitter found for workflowId={} — event '{}' dropped", workflowId, eventName);
-            return;
+            return false;
         }
         try {
             emitter.send(
@@ -73,11 +73,13 @@ public class SseEmitterRegistry {
                     .name(eventName)
                     .data(data, MediaType.APPLICATION_JSON)
             );
+            return true;
         } catch (IOException e) {
             // Client disconnected mid-stream — this is expected behaviour, not an error.
             log.warn("SSE send failed for workflowId={} event='{}' — removing dead emitter: {}",
                 workflowId, eventName, e.getMessage());
             emitters.remove(workflowId);
+            return false;
         }
     }
 
@@ -116,8 +118,8 @@ public class SseEmitterRegistry {
     // these overloads avoid UUID.fromString() boilerplate at every call site.
 
     /** @see #send(UUID, String, Object) */
-    public void send(String workflowId, String eventName, Object data) {
-        send(UUID.fromString(workflowId), eventName, data);
+    public boolean send(String workflowId, String eventName, Object data) {
+        return send(UUID.fromString(workflowId), eventName, data);
     }
 
     /** @see #complete(UUID) */

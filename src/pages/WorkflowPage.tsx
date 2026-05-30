@@ -1,9 +1,12 @@
-// src/pages/WorkflowPage.tsx
+import { useEffect } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { useAuthStore } from '../store/authStore';
 import { useWorkflowStore } from '../store/workflowStore';
+import { useDefaultsStore } from '../store/defaultsStore';
 import Button from '../components/common/Button';
 import ScoreBar from '../components/common/ScoreBar';
+import DefaultsChips from '../components/DefaultsChips';
+import CodeReviewPanel from '../components/CodeReviewPanel';
 import { fadeUp, fadeUpLarge } from '../lib/animations';
 import { Check, Loader2, X, GitPullRequest, Clock } from 'lucide-react';
 
@@ -31,6 +34,8 @@ export default function WorkflowPage() {
   const {
     phase,
     goal,
+    workflowId,
+    codeReviewActive,
     liveSteps,
     logs,
     score,
@@ -40,6 +45,16 @@ export default function WorkflowPage() {
     executeWorkflow,
     reset,
   } = useWorkflowStore();
+
+  const { githubDefaultRepo, slackDefaultChannel, isLoaded, fetchDefaults } = useDefaultsStore();
+
+  useEffect(() => {
+    if (!isLoaded) fetchDefaults();
+  }, [isLoaded, fetchDefaults]);
+
+  const placeholderText = isLoaded && githubDefaultRepo
+    ? `e.g. "Work on EC-23 and notify the team" — uses ${githubDefaultRepo}${slackDefaultChannel ? ', ' + slackDefaultChannel : ''} by default`
+    : `e.g. "Create a PR in repo my-app for EC-22, update Jira, and notify #dev-team on Slack"`;
 
   const handleRun = async () => {
     if (!goal.trim()) return;
@@ -100,7 +115,7 @@ export default function WorkflowPage() {
                 <textarea
                   value={goal}
                   onChange={(e) => setGoal(e.target.value)}
-                  placeholder="Create a PR for the auth feature, update Jira, and notify #dev-team on Slack..."
+                  placeholder={placeholderText}
                   className="w-full min-h-[160px] bg-transparent border-0 text-[16px] text-[#F0F0F0] placeholder:text-[#444] resize-none focus:outline-none leading-[1.7]"
                   style={{ fontFamily: 'var(--font-sans)' }}
                   maxLength={590}
@@ -115,6 +130,8 @@ export default function WorkflowPage() {
                   <span className="text-[12px] font-mono text-[#444]">{goal.length} / 590</span>
                 </div>
               </div>
+
+              <DefaultsChips />
 
               <Button
                 variant="primary"
@@ -147,100 +164,122 @@ export default function WorkflowPage() {
               initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
               exit={{ opacity: 0 }}
-              className="max-w-[720px] mx-auto"
+              className="max-w-[720px] mx-auto w-full"
             >
-              {/* Command strip */}
-              <div className="glass-card h-14 px-4 flex items-center gap-3 mb-6">
-                <svg className="w-4 h-4 text-[#F59E0B]" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
-                </svg>
-                <span className="flex-1 text-[14px] font-mono text-[#888] truncate">{goal}</span>
-                <Loader2 className="animate-spin text-[#F59E0B]" size={16} />
-              </div>
+              <AnimatePresence mode="wait">
+                {codeReviewActive && workflowId ? (
+                  <motion.div
+                    key="code-review"
+                    initial={{ opacity: 0 }}
+                    animate={{ opacity: 1 }}
+                    exit={{ opacity: 0 }}
+                    transition={{ duration: 0.25 }}
+                  >
+                    <CodeReviewPanel workflowId={workflowId} />
+                  </motion.div>
+                ) : (
+                  <motion.div
+                    key="step-progress"
+                    initial={{ opacity: 0 }}
+                    animate={{ opacity: 1 }}
+                    exit={{ opacity: 0 }}
+                    transition={{ duration: 0.25 }}
+                  >
+                    {/* Command strip */}
+                    <div className="glass-card h-14 px-4 flex items-center gap-3 mb-6">
+                      <svg className="w-4 h-4 text-[#F59E0B]" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
+                      </svg>
+                      <span className="flex-1 text-[14px] font-mono text-[#888] truncate">{goal}</span>
+                      <Loader2 className="animate-spin text-[#F59E0B]" size={16} />
+                    </div>
 
-              {/* Live log feed */}
-              {logs.length > 0 && (
-                <div className="glass-card p-3 mb-4 max-h-[120px] overflow-y-auto">
-                  {logs.map((log, i) => (
-                    <p key={i} className={`text-[12px] font-mono ${
-                      log.cls === 'error' ? 'text-red-400' :
-                      log.cls === 'warn'  ? 'text-yellow-400' : 'text-[#555]'
-                    }`}>
-                      → {log.msg}
-                    </p>
-                  ))}
-                </div>
-              )}
+                    {/* Live log feed */}
+                    {logs.length > 0 && (
+                      <div className="glass-card p-3 mb-4 max-h-[120px] overflow-y-auto">
+                        {logs.map((log, i) => (
+                          <p key={i} className={`text-[12px] font-mono ${
+                            log.cls === 'error' ? 'text-red-400' :
+                            log.cls === 'warn'  ? 'text-yellow-400' : 'text-[#555]'
+                          }`}>
+                            → {log.msg}
+                          </p>
+                        ))}
+                      </div>
+                    )}
 
-              {/* Steps — real AI-generated from plan_ready */}
-              {liveSteps.length === 0 ? (
-                <div className="glass-card p-6 flex items-center justify-center gap-3">
-                  <Loader2 className="animate-spin text-[#22C55E]" size={20} />
-                  <span className="text-[14px] text-[#555]">AI is planning your workflow...</span>
-                </div>
-              ) : (
-                <div className="space-y-3">
-                  {liveSteps.map((step, index) => {
-                    const colors = getServiceColor(step.tool);
-                    return (
-                      <motion.div
-                        key={index}
-                        variants={fadeUp}
-                        initial="hidden"
-                        animate="show"
-                        transition={{ delay: index * 0.08 }}
-                        className="glass-card p-4"
-                        style={{ borderLeft: `3px solid ${colors.border}` }}
-                      >
-                        <div className="flex items-start gap-4">
-                          <div
-                            className="flex-shrink-0 w-8 h-8 rounded-full flex items-center justify-center text-[13px] font-semibold transition-all"
-                            style={{
-                              border: step.status === 'pending'
-                                ? '2px solid #222'
-                                : `2px solid ${colors.border}`,
-                              background: step.status === 'success'
-                                ? colors.border
-                                : step.status === 'failed'
-                                ? '#EF4444'
-                                : 'transparent',
-                              color: step.status === 'success' || step.status === 'failed'
-                                ? '#080808'
-                                : step.status === 'active'
-                                ? colors.border : '#444',
-                            }}
-                          >
-                            {step.status === 'success' && <Check size={14} />}
-                            {step.status === 'failed'  && <X size={14} />}
-                            {(step.status === 'pending' || step.status === 'active') && index + 1}
-                          </div>
+                    {/* Steps — real AI-generated from plan_ready */}
+                    {liveSteps.length === 0 ? (
+                      <div className="glass-card p-6 flex items-center justify-center gap-3">
+                        <Loader2 className="animate-spin text-[#22C55E]" size={20} />
+                        <span className="text-[14px] text-[#555]">AI is planning your workflow...</span>
+                      </div>
+                    ) : (
+                      <div className="space-y-3">
+                        {liveSteps.map((step, index) => {
+                          const colors = getServiceColor(step.tool);
+                          return (
+                            <motion.div
+                              key={index}
+                              variants={fadeUp}
+                              initial="hidden"
+                              animate="show"
+                              transition={{ delay: index * 0.08 }}
+                              className="glass-card p-4"
+                              style={{ borderLeft: `3px solid ${colors.border}` }}
+                            >
+                              <div className="flex items-start gap-4">
+                                <div
+                                  className="flex-shrink-0 w-8 h-8 rounded-full flex items-center justify-center text-[13px] font-semibold transition-all"
+                                  style={{
+                                    border: step.status === 'pending'
+                                      ? '2px solid #222'
+                                      : `2px solid ${colors.border}`,
+                                    background: step.status === 'success'
+                                      ? colors.border
+                                      : step.status === 'failed'
+                                      ? '#EF4444'
+                                      : 'transparent',
+                                    color: step.status === 'success' || step.status === 'failed'
+                                      ? '#080808'
+                                      : step.status === 'active'
+                                      ? colors.border : '#444',
+                                  }}
+                                >
+                                  {step.status === 'success' && <Check size={14} />}
+                                  {step.status === 'failed'  && <X size={14} />}
+                                  {(step.status === 'pending' || step.status === 'active') && index + 1}
+                                </div>
 
-                          <div className="flex-1 min-w-0">
-                            <h4 className="text-[15px] font-semibold text-[#F0F0F0] capitalize">
-                              {step.tool} — {step.action}
-                            </h4>
-                            {step.status === 'failed' && step.error && (
-                              <p className="text-[12px] text-red-400 mt-1">{step.error}</p>
-                            )}
-                          </div>
+                                <div className="flex-1 min-w-0">
+                                  <h4 className="text-[15px] font-semibold text-[#F0F0F0] capitalize">
+                                    {step.tool} — {step.action}
+                                  </h4>
+                                  {step.status === 'failed' && step.error && (
+                                    <p className="text-[12px] text-red-400 mt-1">{step.error}</p>
+                                  )}
+                                </div>
 
-                          <div className="flex-shrink-0">
-                            {step.status === 'active' && (
-                              <Loader2 className="animate-spin" size={20} style={{ color: colors.border }} />
-                            )}
-                            {step.status === 'success' && (
-                              <Check size={20} style={{ color: colors.border }} />
-                            )}
-                            {step.status === 'failed' && (
-                              <X size={20} className="text-red-400" />
-                            )}
-                          </div>
-                        </div>
-                      </motion.div>
-                    );
-                  })}
-                </div>
-              )}
+                                <div className="flex-shrink-0">
+                                  {step.status === 'active' && (
+                                    <Loader2 className="animate-spin" size={20} style={{ color: colors.border }} />
+                                  )}
+                                  {step.status === 'success' && (
+                                    <Check size={20} style={{ color: colors.border }} />
+                                  )}
+                                  {step.status === 'failed' && (
+                                    <X size={20} className="text-red-400" />
+                                  )}
+                                </div>
+                              </div>
+                            </motion.div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </motion.div>
+                )}
+              </AnimatePresence>
             </motion.div>
           )}
 

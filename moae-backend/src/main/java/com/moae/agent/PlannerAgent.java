@@ -4,6 +4,7 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.moae.client.MoaeClientException;
+import com.moae.dto.UserDefaultsDTO;
 import com.moae.service.GroqLlmService;
 import com.moae.util.JsonExtractUtil;
 import lombok.RequiredArgsConstructor;
@@ -33,28 +34,53 @@ public class PlannerAgent {
 
     public List<Map<String, Object>> planFromNaturalLanguage(
             String userMessage,
+            UserDefaultsDTO defaults,
             com.moae.client.JiraClient jiraClient,
             com.moae.repository.UserIntegrationRepository userIntegrationRepository,
             java.util.UUID userId,
             com.fasterxml.jackson.databind.ObjectMapper mapper) {
 
         log.info("PLANNER STARTED | Extracting intent from message: {}", userMessage);
+        log.debug("User defaults: owner={}, repo={}, jiraKey={}, slack={}",
+                defaults.getGithubOwner(), defaults.getGithubDefaultRepo(),
+                defaults.getJiraProjectKey(), defaults.getSlackDefaultChannel());
 
-        String extractionPrompt = """
+        // ── PHASE 1a: Build defaults-aware intent extraction prompt ──────────
+        // We tell the LLM about the user's saved defaults so it can populate
+        // fields that the goal text does not explicitly mention.
+        // A second Java-side layer (Phase 1b below) double-checks this.
+        String extractionPrompt = String.format("""
                 You are an Intent Extraction Engine.
-                Read the user's message and extract ONLY the requested parameters as a JSON object.
-                Do not hallucinate. Do not infer. If a value is missing, return null.
+                Read the user's goal and extract the requested parameters as JSON.
 
-                Fields to extract:
-                - "ticketId": any Jira ticket key mentioned (e.g. EC-12)
-                - "githubOwner": the repository owner (e.g. from a URL or explicit mention)
-                - "githubRepo": the repository name (e.g. from a URL or explicit mention)
-                - "slackChannel": the slack channel to notify (e.g. #general, #alerts)
+                USER DEFAULTS (use these when the goal does not explicitly mention them):
+                - Default GitHub owner:       %s
+                - Default GitHub repo:        %s
+                - Default Jira project key:   %s
+                - Default Slack channel:      %s
 
-                User Message: """ + userMessage + """
+                GOAL: %s
 
-                Return ONLY valid JSON.
-                """;
+                Extract the following fields. If a value is explicitly mentioned in the goal,
+                use that. If not mentioned, use the default value shown above.
+                If no default exists either (shown as "null" above), return null for that field.
+
+                Return ONLY valid JSON — no explanation, no markdown, no backticks:
+                {
+                  "ticketId":      null or "EC-22",
+                  "githubOwner":   "extracted or default owner",
+                  "githubRepo":    "extracted or default repo",
+                  "slackChannel":  "extracted or default channel",
+                  "jiraProjectKey": "extracted or default project key",
+                  "isCreateIntent": true or false
+                }
+                """,
+                // Null-safe display — show "null" when a default is not configured
+                defaults.getGithubOwner()         != null ? defaults.getGithubOwner()         : "null",
+                defaults.getGithubDefaultRepo()   != null ? defaults.getGithubDefaultRepo()   : "null",
+                defaults.getJiraProjectKey()      != null ? defaults.getJiraProjectKey()      : "null",
+                defaults.getSlackDefaultChannel() != null ? defaults.getSlackDefaultChannel() : "null",
+                userMessage);
 
         String rawIntent;
         try {
@@ -78,16 +104,38 @@ public class PlannerAgent {
             return plan(userMessage);
         }
 
+        // ── PHASE 1b: Java-side defaults fallback ────────────────────────────
+        // Even if the LLM correctly read the defaults above, apply them again here
+        // as a deterministic safety net.  Precedence:
+        //   1. Explicit value in goal text (LLM extracted it → not null)
+        //   2. User's saved default (UserDefaultsDTO field → not null)
+        //   3. Hardcoded constant (last resort — avoids NullPointerException downstream)
         String ticketId = (String) intent.get("ticketId");
+
         String githubOwner = (String) intent.get("githubOwner");
-        if (githubOwner == null)
+        if (defaults.getGithubOwner() != null && !defaults.getGithubOwner().isBlank()) {
+            githubOwner = defaults.getGithubOwner(); // always trust the saved default over LLM extraction
+        } else if (githubOwner == null) {
             githubOwner = DEFAULT_GITHUB_OWNER;
+        }
+
         String githubRepo = (String) intent.get("githubRepo");
+        if (githubRepo == null && defaults.getGithubDefaultRepo() != null)
+            githubRepo = defaults.getGithubDefaultRepo();
         if (githubRepo == null)
             githubRepo = DEFAULT_GITHUB_REPO;
+
         String slackChannel = (String) intent.get("slackChannel");
+        if (slackChannel == null && defaults.getSlackDefaultChannel() != null)
+            slackChannel = defaults.getSlackDefaultChannel();
         if (slackChannel == null)
-            slackChannel = "#general";
+            slackChannel = DEFAULT_SLACK_CHANNEL;
+
+        // jiraProjectKey is surfaced from defaults for use in text-based planning
+        // (ticket-aware planning uses the extracted ticketId instead)
+        String jiraProjectKey = (String) intent.get("jiraProjectKey");
+        if (jiraProjectKey == null && defaults.getJiraProjectKey() != null)
+            jiraProjectKey = defaults.getJiraProjectKey();
 
         // Detect CREATE intent — don't fetch a ticket that doesn't exist yet
         String goalLower = userMessage.toLowerCase();
@@ -97,15 +145,21 @@ public class PlannerAgent {
                 || goalLower.contains("add ticket")
                 || goalLower.contains("raise ticket");
 
+        // Also honour the LLM's own isCreateIntent flag if it was set
+        Object llmCreateFlag = intent.get("isCreateIntent");
+        if (Boolean.TRUE.equals(llmCreateFlag)) {
+            isCreateIntent = true;
+        }
+
         // Only route to ticket-aware planning if user wants to UPDATE/TRANSITION
         // an existing ticket — not when they want to create a new one
         boolean isTicketFlow = ticketId != null
                 && !ticketId.isBlank()
-                && !isCreateIntent; // ← THE KEY ADDITION
+                && !isCreateIntent;
 
         log.info(
-                "FINAL INTENT -> ticketId={}, ghOwner={}, ghRepo={}, slackChannel={}, isTicketFlow={}, isCreateIntent={}",
-                ticketId, githubOwner, githubRepo, slackChannel, isTicketFlow, isCreateIntent);
+                "FINAL INTENT -> ticketId={}, ghOwner={}, ghRepo={}, slack={}, jiraKey={}, isTicketFlow={}, isCreateIntent={}",
+                ticketId, githubOwner, githubRepo, slackChannel, jiraProjectKey, isTicketFlow, isCreateIntent);
 
         if (isTicketFlow) {
             log.info("Routing to Ticket-Aware Planning");
@@ -115,8 +169,8 @@ public class PlannerAgent {
                     .map(this::parseConfigJson)
                     .orElseThrow(() -> new RuntimeException("Jira not connected. Cannot process ticket."));
 
-            String domain = (String) jiraConfig.get("domain");
-            String email = (String) jiraConfig.get("email");
+            String domain   = (String) jiraConfig.get("domain");
+            String email    = (String) jiraConfig.get("email");
             String apiToken = (String) jiraConfig.get("apiToken");
 
             com.moae.client.dto.JiraTicketResponse ticket;
@@ -128,7 +182,7 @@ public class PlannerAgent {
                 return plan(userMessage);
             }
 
-            // Pass the extracted intent values into the ticket prompt
+            // Pass the defaults-resolved intent values into the ticket prompt
             return planFromTicketWithIntent(ticket, githubOwner, githubRepo, slackChannel, userMessage);
         } else {
             // Text-based workflow
@@ -161,6 +215,7 @@ public class PlannerAgent {
                         Ticket Summary: %s
                         Ticket Description: %s
                         Ticket Key: %s
+                        Ticket Status: %s
 
                         Target Repo Owner: %s
                         Target Repo Name: %s
@@ -188,11 +243,16 @@ public class PlannerAgent {
                         - createBranch:  repo, newBranchName, baseBranch
                         - pushFile:      owner, repo, filePath, content, commitMessage, branchName
                         - createPR:      owner, repo, title, head, base
-                        - triggerAction: owner, repo, workflowId, ref
+                        - triggerAction: owner, repo, workflowId (exact filename e.g. "ci.yml" or "deploy.yml"), ref
                         - createTicket:  projectKey, summary, description, assigneeEmail
                         - updateStatus:  issueId, transitionName
                         - sendMessage:   channel, text
                         - generateCode:  instruction
+
+                        IMPORTANT — triggerAction rule:
+                        Only include a triggerAction step if the user message EXPLICITLY names
+                        a workflow file (e.g. "trigger ci.yml"). If no workflow file is named,
+                        OMIT the triggerAction step entirely — do NOT guess a filename.
 
                         10. If the goal mentions an email address AND the intent is to assign
                             someone to the ticket, include that email as assigneeEmail param
@@ -200,6 +260,11 @@ public class PlannerAgent {
                             is not requested, omit assigneeEmail entirely from params.
                             Never add a separate updateStatus step after createTicket.
                             Do NOT add updateStatus when the intent is to create a new ticket.
+
+                        11. RULE: Before adding a jira:updateStatus step with transitionName 'In Progress', 
+                            check the ticket's current status (available in the ticket context). 
+                            If the ticket is ALREADY 'In Progress', SKIP the first updateStatus step entirely.
+                            Only add updateStatus steps when the status actually needs to change.
 
                         If any rules conflict with each other or with the user message,
                         these rules take strict precedence. Do not add conflicting steps.
@@ -225,7 +290,7 @@ public class PlannerAgent {
                         Start your response with [ and end with ].
                         If rules conflict, apply the rules strictly and omit the conflicting step.
                         """,
-                userMessage, ticket.summary(), ticket.description(), ticket.issueKey(),
+                userMessage, ticket.summary(), ticket.description(), ticket.issueKey(), ticket.status(),
                 owner, repo, slackChannel, ticket.issueKey());
 
         // planFromTicketWithIntent always has GitHub context injected by the caller
@@ -304,11 +369,16 @@ public class PlannerAgent {
                 - createBranch:  repo, newBranchName, baseBranch
                 - pushFile:      owner, repo, filePath, content, commitMessage, branchName
                 - createPR:      owner, repo, title, head, base
-                - triggerAction: owner, repo, workflowId, ref
+                - triggerAction: owner, repo, workflowId (exact filename e.g. "ci.yml" or "deploy.yml"), ref
                 - createTicket:  projectKey, summary, description, assigneeEmail
                 - updateStatus:  issueId, transitionName
                 - sendMessage:   channel, text
                 - generateCode:  instruction
+
+                IMPORTANT — triggerAction rule:
+                Only include a triggerAction step if the goal EXPLICITLY names a workflow
+                file (e.g. "trigger ci.yml"). If no workflow file is named, OMIT the
+                triggerAction step entirely — do NOT guess a filename.
 
                 8. If the goal mentions an email address AND the intent is to assign
                    someone to the ticket, include that email as assigneeEmail param
@@ -359,6 +429,7 @@ public class PlannerAgent {
                 Ticket Summary: %s
                 Ticket Description: %s
                 Ticket Key: %s
+                Ticket Status: %s
 
                 Available tools and their actions:
                 - tool: "github" → actions: getFile, createBranch, pushFile, createPR, triggerAction
@@ -381,17 +452,27 @@ public class PlannerAgent {
                 - createBranch:  repo, newBranchName, baseBranch
                 - pushFile:      owner, repo, filePath, content, commitMessage, branchName
                 - createPR:      owner, repo, title, head, base
-                - triggerAction: owner, repo, workflowId, ref
+                - triggerAction: owner, repo, workflowId (exact filename e.g. "ci.yml" or "deploy.yml"), ref
                 - createTicket:  projectKey, summary, description, assigneeEmail
                 - updateStatus:  issueId, transitionName
                 - sendMessage:   channel, text
                 - generateCode:  instruction
+
+                IMPORTANT — triggerAction rule:
+                Only include a triggerAction step if the ticket description or user message
+                EXPLICITLY names a workflow file (e.g. "run ci.yml"). If no workflow file
+                is named, OMIT the triggerAction step entirely — do NOT guess a filename.
 
                 9. If the ticket description or user request mentions an email address AND
                    the intent is to assign someone, include that email as assigneeEmail param
                    in the createTicket step. If no email is mentioned or assignment
                    is not requested, omit assigneeEmail entirely from params.
                    Do NOT add updateStatus when the intent is to create a new ticket.
+
+                10. RULE: Before adding a jira:updateStatus step with transitionName 'In Progress', 
+                    check the ticket's current status (available in the ticket context). 
+                    If the ticket is ALREADY 'In Progress', SKIP the first updateStatus step entirely.
+                    Only add updateStatus steps when the status actually needs to change.
 
                 If any rules conflict with each other or with the ticket content,
                 these rules take strict precedence. Do not add conflicting steps.
@@ -417,7 +498,7 @@ public class PlannerAgent {
                 no <think> tags, no markdown, no backticks.
                 Start your response with [ and end with ].
                 If rules conflict, apply the rules strictly and omit the conflicting step.
-                """, ticket.summary(), ticket.description(), ticket.issueKey(), ticket.issueKey());
+                """, ticket.summary(), ticket.description(), ticket.issueKey(), ticket.status(), ticket.issueKey());
 
         // planFromTicket is always ticket-aware — GitHub steps are intentional here
         return executePlanGeneration(prompt, "Ticket: " + ticket.issueKey(), true, true, true);

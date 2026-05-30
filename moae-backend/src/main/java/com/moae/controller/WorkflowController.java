@@ -2,6 +2,10 @@ package com.moae.controller;
 
 import com.moae.dto.DQScoreDTO;
 import com.moae.dto.MergeConfirmRequest;
+import com.moae.dto.ApproveCodeRequest;
+import com.moae.dto.IterateCodeRequest;
+import com.moae.dto.IterateCodeResponse;
+import com.moae.dto.PendingCodeResponse;
 import com.moae.dto.WorkflowDetailDTO;
 import com.moae.dto.WorkflowExecuteRequest;
 import com.moae.dto.WorkflowExecuteResponse;
@@ -17,6 +21,7 @@ import com.moae.repository.WorkflowRunRepository;
 import com.moae.repository.WorkflowStepRepository;
 import com.moae.service.MergeConfirmService;
 import com.moae.service.WorkflowOrchestrator;
+import com.moae.service.WorkflowService;
 import com.moae.sse.SseEmitterRegistry;
 import com.moae.util.SessionUtil;
 import jakarta.servlet.http.HttpSession;
@@ -71,6 +76,7 @@ public class WorkflowController {
     private final SseEmitterRegistry     sseEmitterRegistry;
     private final UserRepository         userRepository;
     private final MergeConfirmService    mergeConfirmService;
+    private final WorkflowService        workflowService;
 
     // ─────────────────────────────────────────────────────────────────────────
     // STEP 4: POST /api/workflow/execute
@@ -380,5 +386,54 @@ public class WorkflowController {
                 .collect(Collectors.toList());
 
         return ResponseEntity.ok(stepDetails);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // CODE REVIEW ENDPOINTS
+    // ─────────────────────────────────────────────────────────────────────────
+
+    @GetMapping("/{workflowId}/pending-code")
+    public ResponseEntity<PendingCodeResponse> getPendingCode(
+            @PathVariable String workflowId,
+            HttpSession session) {
+        UUID userId = SessionUtil.getUserId(session);
+        UUID wfId;
+        try {
+            wfId = UUID.fromString(workflowId);
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().build();
+        }
+        return ResponseEntity.ok(workflowService.getPendingCode(wfId, userId));
+    }
+
+    @PostMapping("/{workflowId}/iterate-code")
+    public ResponseEntity<IterateCodeResponse> iterateCode(
+            @PathVariable String workflowId,
+            @RequestBody IterateCodeRequest request,
+            HttpSession session) {
+        UUID userId = SessionUtil.getUserId(session);
+        UUID wfId;
+        try {
+            wfId = UUID.fromString(workflowId);
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().build();
+        }
+        return ResponseEntity.ok(workflowService.iterateCode(wfId, userId, request));
+    }
+
+    @PostMapping("/{workflowId}/approve-code")
+    public ResponseEntity<?> approveCode(
+            @PathVariable String workflowId,
+            @RequestBody ApproveCodeRequest request,
+            HttpSession session) {
+        UUID userId = SessionUtil.getUserId(session);
+        UUID wfId;
+        try {
+            wfId = UUID.fromString(workflowId);
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().build();
+        }
+        workflowService.approveCode(wfId, userId, request);
+        return ResponseEntity.accepted().body(Map.of("message", "Code approved. Resuming workflow..."));
     }
 }

@@ -16,5 +16,7 @@ public enum WorkflowStatus {
     PARTIAL,
     FAILED,
     AWAITING_MERGE,
-    COMPLETED
+    COMPLETED,
+    /** Pipeline is paused after generateCode — waiting for the user to review/approve the code. */
+    AWAITING_CODE_REVIEW
 }

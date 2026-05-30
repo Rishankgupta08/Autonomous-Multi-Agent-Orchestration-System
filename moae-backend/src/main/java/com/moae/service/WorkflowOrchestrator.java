@@ -7,6 +7,7 @@ import com.moae.agent.PlannerAgent;
 import com.moae.agent.VerifierAgent;
 import com.moae.agent.dto.StepResult;
 import com.moae.agent.dto.VerificationResult;
+import com.moae.dto.UserDefaultsDTO;
 import com.moae.entity.WorkflowRun;
 import com.moae.entity.WorkflowStep;
 import com.moae.enums.StepStatus;
@@ -19,6 +20,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
+import jakarta.annotation.PreDestroy;
 
 import java.time.LocalDateTime;
 import java.util.ArrayList;
@@ -26,6 +28,11 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Orchestrates the three-agent pipeline (Planner → Executor → Verifier)
@@ -68,6 +75,36 @@ public class WorkflowOrchestrator {
     private final ObjectMapper objectMapper;
     private final com.moae.client.JiraClient jiraClient;
     private final UserIntegrationRepository userIntegrationRepository;
+    private final UserDefaultsService userDefaultsService;
+
+    private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
+    private final Map<String, ScheduledFuture<?>> activeHeartbeats = new ConcurrentHashMap<>();
+
+    private void startHeartbeat(String workflowId) {
+        ScheduledFuture<?> heartbeat = scheduler.scheduleAtFixedRate(() -> {
+            try {
+                boolean sent = sseEmitterRegistry.send(workflowId, "heartbeat", Map.of("t", System.currentTimeMillis()));
+                if (!sent) {
+                    cancelHeartbeat(workflowId);
+                }
+            } catch (Exception ignored) {
+                cancelHeartbeat(workflowId);
+            }
+        }, 0, 20, TimeUnit.SECONDS);
+        activeHeartbeats.put(workflowId, heartbeat);
+    }
+
+    private void cancelHeartbeat(String workflowId) {
+        ScheduledFuture<?> heartbeat = activeHeartbeats.remove(workflowId);
+        if (heartbeat != null) {
+            heartbeat.cancel(false);
+        }
+    }
+
+    @PreDestroy
+    public void cleanup() {
+        scheduler.shutdownNow();
+    }
 
     /**
      * Executes the full pipeline on a Spring @Async thread pool thread.
@@ -93,8 +130,17 @@ public class WorkflowOrchestrator {
             sseEmitterRegistry.send(workflowId, "log",
                     Map.of("msg", "Analysing your request...", "cls", "ok"));
 
+            // Load user defaults BEFORE planning so the planner can use them
+            // as fallback context for owner, repo, Jira key, and Slack channel.
+            // Returns an all-null DTO (never null itself) when no defaults are saved.
+            UserDefaultsDTO defaults = userDefaultsService.getDefaults(userId);
+            log.debug("Loaded defaults for userId={}: owner={}, repo={}, jiraKey={}, slack={}",
+                    userId, defaults.getGithubOwner(), defaults.getGithubDefaultRepo(),
+                    defaults.getJiraProjectKey(), defaults.getSlackDefaultChannel());
+
             List<Map<String, Object>> plan = plannerAgent.planFromNaturalLanguage(
                     message,
+                    defaults,
                     jiraClient,
                     userIntegrationRepository,
                     userId,
@@ -136,80 +182,167 @@ public class WorkflowOrchestrator {
             List<StepResult> stepResults = executorAgent.execute(
                     plan, run.getId(), userId, workflowId);
 
+            // Fetch the latest state to see if execution was paused
+            run = workflowRunRepository.findById(run.getId()).orElse(run);
+            if (run.getStatus() == WorkflowStatus.AWAITING_CODE_REVIEW) {
+                log.info("Workflow {} paused for code review. Orchestrator exiting early.", workflowId);
+                startHeartbeat(workflowId);
+                return;
+            }
+
             sseEmitterRegistry.send(workflowId, "log",
                     Map.of("msg", "Execution complete. Starting verification...", "cls", "ok"));
 
-            // ── PHASE 3: VERIFICATION ─────────────────────────────────────────
-
-            VerificationResult verification = verifierAgent.verify(message, stepResults);
-
-            // ── PHASE 4: PERSIST FINAL STATE ──────────────────────────────────
-
-            // Check if any step was a successful PR creation
-            String prUrl = null;
-            Integer prNumber = null;
-            for (StepResult sr : stepResults) {
-                if ("github".equals(sr.getTool()) && "createPR".equals(sr.getAction())
-                        && StepStatus.SUCCESS.equals(sr.getStatus())) {
-                    if (sr.getResultJson() != null) {
-                        try {
-                            Map<String, Object> prData = objectMapper.readValue(sr.getResultJson(),
-                                    new com.fasterxml.jackson.core.type.TypeReference<>() {
-                                    });
-                            prUrl = (String) prData.get("prUrl");
-                            prNumber = (Integer) prData.get("prNumber");
-                        } catch (Exception e) {
-                            log.warn("Failed to parse PR result json: {}", sr.getResultJson(), e);
-                        }
-                    }
-                }
-            }
-
-            WorkflowStatus finalStatus;
-            if (prUrl != null || prNumber != null) {
-                finalStatus = WorkflowStatus.COMPLETED;
-                run.setPrUrl(prUrl);
-                run.setPrNumber(prNumber);
-                run.setPrMerged(false);
-            } else {
-                finalStatus = "SUCCESS".equals(verification.getVerdict())
-                        ? WorkflowStatus.SUCCESS
-                        : WorkflowStatus.FAILED;
-            }
-
-            run.setStatus(finalStatus);
-            run.setOverallScore(verification.getOverallScore());
-            run.setTaskCompletion(verification.getTaskCompletion());
-            run.setDecisionAccuracy(verification.getDecisionAccuracy());
-            run.setExecutionEfficiency(verification.getExecutionEfficiency());
-            run.setContextRelevance(verification.getContextRelevance());
-            run.setScoreSummary(verification.getSummary());
-            run.setCompletedAt(LocalDateTime.now());
-            workflowRunRepository.save(run);
-
-            // ── PHASE 5: EMIT WORKFLOW_COMPLETE + CLOSE SSE ───────────────────
-
-            Map<String, Object> completePayload = new HashMap<>();
-            completePayload.put("workflowId", workflowId);
-            completePayload.put("overallStatus", verification.getVerdict());
-            completePayload.put("score", verification.getOverallScore());
-            completePayload.put("taskCompletion", verification.getTaskCompletion());
-            completePayload.put("decisionAccuracy", verification.getDecisionAccuracy());
-            completePayload.put("executionEfficiency", verification.getExecutionEfficiency());
-            completePayload.put("contextRelevance", verification.getContextRelevance());
-            completePayload.put("summary", verification.getSummary());
-            completePayload.put("results", buildStepResultsPayload(stepResults));
-
-            sseEmitterRegistry.send(workflowId, "workflow_complete", completePayload);
-            sseEmitterRegistry.complete(workflowId);
-
-            log.info("Workflow {} completed → {} | score: {}",
-                    workflowId, verification.getVerdict(), verification.getOverallScore());
+            finalizeWorkflow(run, stepResults, message, workflowId);
 
         } catch (Exception e) {
             log.error("FULL STACKTRACE", e);
             failWorkflow(workflowId, e);
         }
+    }
+
+    /**
+     * Resumes a paused workflow after the user approves the pending code.
+     */
+    @Async
+    public void resumeFromCodeApproval(UUID workflowRunId, UUID userId) {
+        String workflowId = workflowRunId.toString();
+        log.info("ORCHESTRATOR RESUMING: {}", workflowId);
+        cancelHeartbeat(workflowId);
+        try {
+            WorkflowRun run = workflowRunRepository
+                    .findById(workflowRunId)
+                    .orElseThrow(() -> new RuntimeException("WorkflowRun not found: " + workflowId));
+
+            sseEmitterRegistry.send(workflowId, "log",
+                    Map.of("msg", "Resuming execution after code approval...", "cls", "ok"));
+
+            // 1. Reconstruct the plan
+            List<WorkflowStep> steps = workflowStepRepository.findByWorkflowRunIdOrderByStepIdAsc(workflowRunId);
+            List<Map<String, Object>> plan = new ArrayList<>();
+            for (WorkflowStep step : steps) {
+                Map<String, Object> planStep = new HashMap<>();
+                planStep.put("tool", step.getTool());
+                planStep.put("action", step.getAction());
+                try {
+                    Map<String, Object> params = objectMapper.readValue(step.getParamsJson(), new com.fasterxml.jackson.core.type.TypeReference<>() {});
+                    planStep.put("params", params);
+                } catch (Exception e) {
+                    planStep.put("params", new HashMap<>());
+                }
+                plan.add(planStep);
+            }
+
+            // 2. Fetch completed steps results
+            List<StepResult> previousResults = new ArrayList<>();
+            for (WorkflowStep step : steps) {
+                if (step.getStepId() < run.getResumeFromStep()) {
+                    previousResults.add(StepResult.builder()
+                            .stepId(step.getStepId())
+                            .tool(step.getTool())
+                            .action(step.getAction())
+                            .paramsJson(step.getParamsJson())
+                            .status(step.getStatus())
+                            .resultJson(step.getResultJson())
+                            .timeTakenMs(step.getTimeTakenMs() != null ? step.getTimeTakenMs() : 0L)
+                            .failureReason(step.getFailureReason())
+                            .build());
+                }
+            }
+
+            // 3. Resume execution
+            List<StepResult> newResults = executorAgent.resume(
+                    plan, run.getId(), userId, workflowId, run.getResumeFromStep(), run.getPendingCode());
+
+            List<StepResult> allResults = new ArrayList<>(previousResults);
+            allResults.addAll(newResults);
+
+            // Fetch the latest state to see if execution was paused again (unlikely but safe)
+            run = workflowRunRepository.findById(run.getId()).orElse(run);
+            if (run.getStatus() == WorkflowStatus.AWAITING_CODE_REVIEW) {
+                log.info("Workflow {} paused for code review again. Orchestrator exiting early.", workflowId);
+                return;
+            }
+
+            sseEmitterRegistry.send(workflowId, "log",
+                    Map.of("msg", "Execution complete. Starting verification...", "cls", "ok"));
+
+            // 4. Continue to Phase 3
+            finalizeWorkflow(run, allResults, run.getGoal(), workflowId);
+
+        } catch (Exception e) {
+            log.error("FULL STACKTRACE", e);
+            failWorkflow(workflowId, e);
+        }
+    }
+
+    private void finalizeWorkflow(WorkflowRun run, List<StepResult> stepResults, String message, String workflowId) {
+        // ── PHASE 3: VERIFICATION ─────────────────────────────────────────
+
+        VerificationResult verification = verifierAgent.verify(message, stepResults);
+
+        // ── PHASE 4: PERSIST FINAL STATE ──────────────────────────────────
+
+        // Check if any step was a successful PR creation
+        String prUrl = null;
+        Integer prNumber = null;
+        for (StepResult sr : stepResults) {
+            if ("github".equals(sr.getTool()) && "createPR".equals(sr.getAction())
+                    && StepStatus.SUCCESS.equals(sr.getStatus())) {
+                if (sr.getResultJson() != null) {
+                    try {
+                        Map<String, Object> prData = objectMapper.readValue(sr.getResultJson(),
+                                new com.fasterxml.jackson.core.type.TypeReference<>() {
+                                });
+                        prUrl = (String) prData.get("prUrl");
+                        prNumber = (Integer) prData.get("prNumber");
+                    } catch (Exception e) {
+                        log.warn("Failed to parse PR result json: {}", sr.getResultJson(), e);
+                    }
+                }
+            }
+        }
+
+        WorkflowStatus finalStatus;
+        if (prUrl != null || prNumber != null) {
+            finalStatus = WorkflowStatus.COMPLETED;
+            run.setPrUrl(prUrl);
+            run.setPrNumber(prNumber);
+            run.setPrMerged(false);
+        } else {
+            finalStatus = "SUCCESS".equals(verification.getVerdict())
+                    ? WorkflowStatus.SUCCESS
+                    : WorkflowStatus.FAILED;
+        }
+
+        run.setStatus(finalStatus);
+        run.setOverallScore(verification.getOverallScore());
+        run.setTaskCompletion(verification.getTaskCompletion());
+        run.setDecisionAccuracy(verification.getDecisionAccuracy());
+        run.setExecutionEfficiency(verification.getExecutionEfficiency());
+        run.setContextRelevance(verification.getContextRelevance());
+        run.setScoreSummary(verification.getSummary());
+        run.setCompletedAt(LocalDateTime.now());
+        workflowRunRepository.save(run);
+
+        // ── PHASE 5: EMIT WORKFLOW_COMPLETE + CLOSE SSE ───────────────────
+
+        Map<String, Object> completePayload = new HashMap<>();
+        completePayload.put("workflowId", workflowId);
+        completePayload.put("overallStatus", verification.getVerdict());
+        completePayload.put("score", verification.getOverallScore());
+        completePayload.put("taskCompletion", verification.getTaskCompletion());
+        completePayload.put("decisionAccuracy", verification.getDecisionAccuracy());
+        completePayload.put("executionEfficiency", verification.getExecutionEfficiency());
+        completePayload.put("contextRelevance", verification.getContextRelevance());
+        completePayload.put("summary", verification.getSummary());
+        completePayload.put("results", buildStepResultsPayload(stepResults));
+
+        sseEmitterRegistry.send(workflowId, "workflow_complete", completePayload);
+        sseEmitterRegistry.complete(workflowId);
+
+        log.info("Workflow {} completed → {} | score: {}",
+                workflowId, verification.getVerdict(), verification.getOverallScore());
     }
 
     // ═══════════════════════════════════════════════════════════════════════════

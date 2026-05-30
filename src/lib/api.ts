@@ -1,6 +1,6 @@
 // src/lib/api.ts
 
-const BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8080';
+const BASE_URL = (import.meta as any).env?.VITE_API_BASE_URL || '';
 
 // ─────────────────────────────────────────────────────────────────────
 // Core fetch wrapper
@@ -26,7 +26,7 @@ async function apiFetch<T>(
 
   // Handle 204 No Content
   const text = await response.text();
-  return text ? JSON.parse(text) : null;
+  return text ? JSON.parse(text) : (null as any);
 }
 
 // ─────────────────────────────────────────────────────────────────────
